@@ -117,8 +117,8 @@ npm audit --audit-level=moderate
 git diff --check
 ```
 
-- `npm test`: ten suites execute actual production modules in jsdom/VM with mocked Chrome, portal and Supabase transports. **113 passed, 0 failed/cancelled/skipped** (97 top-level tests, including nested cases).
-- `npm run check`: **45 JavaScript syntax checks**, plus MV3 wiring/world/order/file/version and DNR-ID validation. This is not a real Chrome load test.
+- `npm test`: eleven suites execute actual production modules in jsdom/VM with mocked Chrome, portal and Supabase transports. **120 passed, 0 failed/cancelled/skipped** (104 top-level tests, including nested cases).
+- `npm run check`: **46 JavaScript syntax checks**, plus MV3 wiring/world/order/file/version and DNR-ID validation. This is not a real Chrome load test.
 - `npm run test:compat`: **18 existing top-level test commands passed**. They intentionally delegate to production-module runtime suites rather than copied matcher/lifecycle models or obsolete reload/retry assumptions. These are repeated cases, **not 18 additional unique test suites**.
 - `npm audit --audit-level=moderate`: **0 vulnerabilities** at the time of validation.
 - Scale regression: 700 dynamic filters, 100 network leads, 100 full indexed matcher evaluations. The last local diagnostic was **246.8 ms for the batch**; this is not IndiaMART/Vercel/Supabase latency or an acquisition-time guarantee.
@@ -138,6 +138,8 @@ No build artifacts, dependency directories, seller sessions, credential captures
 | `service-worker.js` | MV3 messaging, restricted Supabase proxy, alarms and recovery |
 | `popup/`, `config/`, `debug/` | Existing mode controls, settings/filter editor and diagnostics |
 | `tests/runtime/`, `scripts/` | Production-module regression harness and validation commands |
+| `tests/browser/startup-smoke.cjs` | Optional controlled Chromium startup comparison; Chrome APIs emulated, not an MV3 load test |
+| `docs/STARTUP_REGRESSION_REPORT.md` | Confirmed panel/filter startup regressions, evidence and pending live checks |
 | `arch.MD` | Current architecture, limits and contracts |
 | `docs/LIVE_VALIDATION.md` | Safe logged-in portal/CRM acceptance checklist |
 | `ANTIGRAVITY_CHANGE_REPORT.md` | Root causes, fixes, exact local checks and live limitations |
