@@ -1,0 +1,1037 @@
+// src/supabase-service.js
+// Complete Supabase integration with data management
+// Developed by Keyn Labs
+// Version 4.9.0
+// ============================================================================
+// CHANGELOG v4.9.0
+//   • insertLead returns { data, conflict, existingId } on 409 (no throw)
+//   • getRecentLeads(limit, statuses) — optional status filter
+//   • _flushStats early-returns if no filters cached
+//   • Filters cache TTL: 30s → 10s
+//   • updateFilterStatus debounced (5s coalesce window)
+//   • markLeadContacted fires history insert in parallel (non-blocking)
+//   • AbortController timeouts on all mutating fetches
+//   • getFilterById() + getActiveFilterCount() helpers added
+//   • healthCheck gets 5s timeout
+//   • More robust _extractCount across PostgREST versions
+// ============================================================================
+
+const SUPABASE_URL = 'https://zvhuromubukylsxrsfiz.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp2aHVyb211YnVreWxzeHJzZml6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwODI4MDYsImV4cCI6MjEwMzY1ODgwNn0.29J2uGHxFhPtEqRZvnXjaYpL-x4I0uEc2TT8u9d5PVw';
+
+// Default network timeouts (ms)
+const TIMEOUT_READ   = 15000;
+const TIMEOUT_WRITE  = 15000;
+const TIMEOUT_HEALTH = 5000;
+
+class SupabaseService {
+    constructor() {
+        this.url = SUPABASE_URL;
+        this.key = SUPABASE_KEY;
+        this.headers = {
+            'apikey': this.key,
+            'Authorization': 'Bearer ' + this.key,
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation'
+        };
+        this.logger = null;
+        this._filters = [];
+        this._filtersLoaded = false;
+        this._filtersLastFetch = 0;
+        this._filtersTTL = 30000; // 30s in-memory cache TTL (reduces redundant polling micro-jank) // 30s in-memory cache TTL
+        this._filtersCacheKey = 'cached_filters_v1';
+        this._filtersCacheTTL = 60000; // 60s storage cache TTL
+        this._inFlightFetchPromise = null;
+        this._clientId = 'default';
+        this._statsBuffer = { scanned: 0, matched: 0, clicked: 0 };
+        this._statsFlushTimer = null;
+        this._statsPending = false;
+        this._filterStatusLastPushed = 0;
+        this._filterStatusPending = null;
+    }
+
+    // ============================================================
+    // LOGGING (Privacy-Safe)
+    // ============================================================
+    setLogger(logger) {
+        this.logger = logger;
+    }
+
+    _sanitizeLogData(data) {
+        if (!data || typeof data !== 'object') return data;
+        var clean = Array.isArray(data) ? [] : {};
+        for (var k in data) {
+            if (!data.hasOwnProperty(k)) continue;
+            var val = data[k];
+            var kLow = k.toLowerCase();
+            if (kLow.indexOf('mobile') !== -1 || kLow.indexOf('phone') !== -1) {
+                clean[k] = typeof val === 'string' && val.length > 4 ? '***' + val.slice(-4) : '***';
+            } else if (kLow.indexOf('email') !== -1) {
+                clean[k] = typeof val === 'string' && val.indexOf('@') !== -1 ? val.replace(/^.+@/, '***@') : '***';
+            } else if (kLow.indexOf('token') !== -1 || kLow.indexOf('auth') !== -1 || kLow.indexOf('key') !== -1 || kLow.indexOf('cookie') !== -1) {
+                clean[k] = '[REDACTED]';
+            } else if (val && typeof val === 'object') {
+                clean[k] = this._sanitizeLogData(val);
+            } else {
+                clean[k] = val;
+            }
+        }
+        return clean;
+    }
+
+    _log(level, msgOrEvent, data) {
+        if (!this.logger) return;
+        var lvl = (level || 'info').toLowerCase();
+        if (typeof this.logger.logEvent === 'function' && typeof msgOrEvent === 'string' && msgOrEvent.indexOf('.') !== -1) {
+            var opts = Object.assign({}, data || {});
+            opts.level = lvl.toUpperCase();
+            opts.event = msgOrEvent;
+            opts.component = 'SupabaseService';
+            this.logger.logEvent(opts);
+            return;
+        }
+        if (typeof this.logger[lvl] === 'function') {
+            this.logger[lvl](msgOrEvent, this._sanitizeLogData(data));
+        }
+    }
+
+    // ============================================================
+    // FETCH HELPERS (AbortController timeouts)
+    // ============================================================
+    async _fetchWithTimeout(url, options, timeoutMs) {
+        timeoutMs = timeoutMs || TIMEOUT_READ;
+
+        // Try service worker proxy first (bypasses webpage CSP/CORS on IndiaMART)
+        if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+            try {
+                var swResponse = await new Promise(function(resolve, reject) {
+                    var timer = setTimeout(function() {
+                        reject(new Error('Timeout after ' + timeoutMs + 'ms'));
+                    }, timeoutMs);
+
+                    var cleanOptions = options ? {
+                        method: options.method || 'GET',
+                        headers: options.headers || {},
+                        body: options.body || undefined
+                    } : undefined;
+
+                    chrome.runtime.sendMessage({
+                        action: 'SUPABASE_FETCH',
+                        url: url,
+                        options: cleanOptions,
+                        timeoutMs: timeoutMs
+                    }, function(response) {
+                        clearTimeout(timer);
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message));
+                        } else if (!response) {
+                            reject(new Error('No response from service worker'));
+                        } else if (response.error) {
+                            reject(new Error(response.error));
+                        } else {
+                            resolve(response);
+                        }
+                    });
+                });
+
+                var headersMap = swResponse.headers || {};
+                return {
+                    ok: !!swResponse.ok,
+                    status: swResponse.status || 0,
+                    statusText: swResponse.statusText || '',
+                    headers: {
+                        get: function(name) {
+                            return headersMap[(name || '').toLowerCase()] || null;
+                        }
+                    },
+                    text: async function() {
+                        return swResponse.body || '';
+                    },
+                    json: async function() {
+                        return swResponse.body ? JSON.parse(swResponse.body) : null;
+                    }
+                };
+            } catch (swErr) {
+                // If service worker message fails or times out, seamlessly fall back to direct fetch without alarming warnings
+                if (this.logger && typeof this.logger.debug === 'function') {
+                    this.logger.debug('Service worker proxy unavailable (' + swErr.message + '), falling back to direct fetch');
+                }
+            }
+        }
+
+        // Direct fetch fallback
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+        try {
+            var opts = Object.assign({}, options || {}, { signal: controller.signal });
+            var res = await fetch(url, opts);
+            clearTimeout(timer);
+            return res;
+        } catch (err) {
+            clearTimeout(timer);
+            if (err.name === 'AbortError') {
+                throw new Error('Timeout after ' + timeoutMs + 'ms');
+            }
+            throw err;
+        }
+    }
+
+    // ============================================================
+    // FILTERS - Fetch and cache
+    // ============================================================
+    /**
+     * Load active filters. Cached for _filtersTTL ms.
+     * @param {boolean} forceRefresh
+     * @returns {Promise<Array>}
+     */
+    async loadFilters(forceRefresh) {
+        var self = this;
+        var now = Date.now();
+
+        // 1) In-flight coalescing — return existing shared promise if a network fetch is ongoing
+        if (this._inFlightFetchPromise) {
+            return this._inFlightFetchPromise;
+        }
+
+        // 2) In-memory cache — fast reads
+        if (!forceRefresh && this._filtersLoaded && (now - this._filtersLastFetch) < this._filtersTTL) {
+            this._log('debug', 'filters.cache.hit', {
+                reasonCode: 'MEMORY_CACHE_VALID',
+                context: { count: this._filters.length }
+            });
+            return true;
+        }
+
+        // 3) Storage cache — instant cold boot only (if within cache TTL)
+        if (!forceRefresh && !this._filtersLoaded) {
+            var cached = await this._readFiltersCache();
+            if (cached && Array.isArray(cached.filters)) {
+                var cacheAge = now - cached.timestamp;
+                if (cacheAge <= this._filtersCacheTTL) {
+                    var tCache0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                    this._filters = cached.filters;
+                    this._filtersLoaded = true;
+                    this._filtersLastFetch = cached.timestamp;
+                    var cacheDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tCache0;
+                    this._log('info', 'filters.cache.hit', {
+                        reasonCode: 'STORAGE_CACHE_VALID',
+                        durationMs: cacheDuration,
+                        context: {
+                            count: this._filters.length,
+                            ageSec: Math.round(cacheAge / 1000)
+                        }
+                    });
+                    if (this._filters.length > 0 && this._filters[0].client_id) {
+                        this._clientId = this._filters[0].client_id;
+                    }
+                    this._refreshFiltersInBackground();
+                    return true;
+                }
+            }
+        }
+
+        this._log('debug', 'filters.cache.miss', {
+            reasonCode: forceRefresh ? 'FORCE_REFRESH' : 'CACHE_EXPIRED'
+        });
+
+        // 4) Network fetch (coalesced)
+        this._inFlightFetchPromise = this._fetchFiltersFromNetwork().finally(function () {
+            self._inFlightFetchPromise = null;
+        });
+        return this._inFlightFetchPromise;
+    }
+
+    async _fetchFiltersFromNetwork() {
+        var syncOpId = 'op_sync_' + Date.now().toString(36);
+        var tSync0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        this._log('info', 'filters.sync.started', { operationId: syncOpId });
+
+        var maxRetries = 2;
+        var attempt = 0;
+        var lastErr = null;
+        while (attempt < maxRetries) {
+            try {
+                var url = this.url + '/rest/v1/filters?is_active=eq.true&select=*&order=id.asc';
+                var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+
+                var data = await response.json();
+                this._filters = Array.isArray(data) ? data : [];
+                this._filtersLoaded = true;
+                this._filtersLastFetch = Date.now();
+
+                if (this._filters.length > 0 && this._filters[0].client_id) {
+                    this._clientId = this._filters[0].client_id;
+                }
+
+                // Write to storage cache only if semantic filter content changed (excluding updated_at / poll timestamps)
+                var newSig = this._buildSemanticSignature(this._filters);
+                var configChanged = this._lastWrittenFiltersSig !== newSig;
+                if (configChanged) {
+                    this._lastWrittenFiltersSig = newSig;
+                    await this._writeFiltersCache(this._filters);
+                    this._log('info', 'filters.config.changed', {
+                        operationId: syncOpId,
+                        reasonCode: 'CONFIG_CHANGED',
+                        context: { count: this._filters.length }
+                    });
+                } else {
+                    this._log('debug', 'filters.config.unchanged', {
+                        operationId: syncOpId,
+                        reasonCode: 'CONFIG_UNCHANGED',
+                        context: { count: this._filters.length }
+                    });
+                }
+
+                var syncDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tSync0;
+                this._log('info', 'filters.sync.completed', {
+                    operationId: syncOpId,
+                    result: 'SUCCESS',
+                    durationMs: syncDuration,
+                    context: { count: this._filters.length }
+                });
+                return true;
+            } catch (err) {
+                lastErr = err;
+                attempt++;
+                if (attempt < maxRetries) {
+                    await new Promise(function(r) { setTimeout(r, 50 * attempt); });
+                }
+            }
+        }
+        var failDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tSync0;
+        this._log('error', 'filters.sync.completed', {
+            operationId: syncOpId,
+            result: 'FAILURE',
+            reasonCode: 'NETWORK_TIMEOUT',
+            durationMs: failDuration,
+            error: lastErr ? { message: lastErr.message } : { message: 'Unknown error' }
+        });
+        return false;
+    }
+
+    _buildSemanticSignature(filters) {
+        return JSON.stringify((filters || []).map(function (f) {
+            return {
+                id: f.id,
+                name: f.name || f.filter_name || '',
+                kw: (f.product_keywords || []).slice().sort(),
+                neg: (f.negative_keywords || []).slice().sort(),
+                loc: (f.sender_locations || []).slice().sort(),
+                act: f.is_active,
+                mode: f.match_mode || 'any',
+                del: f.is_deleted || f.deleted_at ? true : false
+            };
+        }));
+    }
+
+    setClientId(clientId) {
+        this._clientId = clientId || 'default';
+    }
+
+    _refreshFiltersInBackground() {
+        var self = this;
+        this._log('info', '🔄 Refreshing filters in background...');
+        // Fire and forget — do not await
+        this._fetchFiltersFromNetwork().catch(function() {});
+    }
+
+    _readFiltersCache() {
+        var self = this;
+        return new Promise(function(resolve) {
+            try {
+                chrome.storage.local.get(self._filtersCacheKey, function(result) {
+                    var cached = result && result[self._filtersCacheKey];
+                    if (cached && typeof cached.timestamp === 'number') {
+                        resolve(cached);
+                    } else {
+                        resolve(null);
+                    }
+                });
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    }
+
+    _writeFiltersCache(filters) {
+        var self = this;
+        return new Promise(function(resolve) {
+            try {
+                var payload = {};
+                payload[self._filtersCacheKey] = {
+                    filters: filters,
+                    timestamp: Date.now()
+                };
+                chrome.storage.local.set(payload, function() { resolve(); });
+            } catch (e) {
+                resolve();
+            }
+        });
+    }
+
+    /** @returns {Array} Currently cached filters */
+    getFilters() {
+        return this._filters;
+    }
+
+    /**
+     * Fetch a single filter by id. Always hits the network (no cache).
+     * @param {number|string} id
+     * @returns {Promise<Object|null>}
+     */
+    async getFilterById(id) {
+        try {
+            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(id) + '&select=*&limit=1';
+            var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            var arr = await response.json();
+            return Array.isArray(arr) && arr.length > 0 ? arr[0] : null;
+        } catch (err) {
+            this._log('warn', 'getFilterById failed', { id: id, error: err.message });
+            return null;
+        }
+    }
+
+    /**
+     * Count of currently active filters.
+     * @returns {Promise<number>}
+     */
+    async getActiveFilterCount() {
+        try {
+            var url = this.url + '/rest/v1/filters?is_active=eq.true&select=id';
+            var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            var arr = await response.json();
+            return Array.isArray(arr) ? arr.length : 0;
+        } catch (err) {
+            return 0;
+        }
+    }
+
+    // ============================================================
+    // FILTER STATUS (debounced — coalesces rapid calls)
+    // ============================================================
+    /**
+     * Mark all active filters as running/not-running.
+     * Debounced: rapid calls within 5s collapse into a single PATCH.
+     * @param {boolean} isRunning
+     * @returns {Promise<boolean>}
+     */
+    async updateFilterStatus(isRunning) {
+        var now = Date.now();
+        this._filterStatusPending = isRunning;
+
+        // If a call was made < 5s ago with the same value, skip entirely
+        if (this._filterStatusLastPushed &&
+            (now - this._filterStatusLastPushed) < 5000 &&
+            this._filterStatusLastPushed_value === isRunning) {
+            return true;
+        }
+
+        // Coalesce: if we just fired, debounce
+        if (this._filterStatusLastPushed && (now - this._filterStatusLastPushed) < 5000) {
+            var self = this;
+            if (this._filterStatusDebounceTimer) clearTimeout(this._filterStatusDebounceTimer);
+            this._filterStatusDebounceTimer = setTimeout(function() {
+                self._filterStatusDebounceTimer = null;
+                self._doFilterStatusPush(self._filterStatusPending);
+            }, 5000 - (now - this._filterStatusLastPushed));
+            return true;
+        }
+
+        return this._doFilterStatusPush(isRunning);
+    }
+
+    async _doFilterStatusPush(isRunning) {
+        try {
+            var url = this.url + '/rest/v1/filters?is_active=eq.true';
+            var body = {
+                is_running: isRunning,
+                last_poll_time: new Date().toISOString()
+            };
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            this._filterStatusLastPushed = Date.now();
+            this._filterStatusLastPushed_value = isRunning;
+            this._log('debug', '📡 Filter status updated', { isRunning: isRunning });
+            return true;
+        } catch (err) {
+            this._log('warn', 'Failed to update filter status', { error: err.message });
+            return false;
+        }
+    }
+
+    /**
+     * Deactivates a filter when its unique sellers quota (10 leads) is fulfilled.
+     * @param {string|number} filterId
+     * @returns {Promise<boolean>}
+     */
+    async deactivateFilter(filterId) {
+        if (!filterId) return false;
+        try {
+            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(filterId);
+            var body = {
+                is_active: false,
+                is_running: false,
+                updated_at: new Date().toISOString()
+            };
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            // Also update in-memory cache if present
+            if (Array.isArray(this._filters)) {
+                for (var i = 0; i < this._filters.length; i++) {
+                    if (String(this._filters[i].id) === String(filterId)) {
+                        this._filters[i].is_active = false;
+                        this._filters[i].is_running = false;
+                        break;
+                    }
+                }
+            }
+
+            this._log('info', 'Filter auto-deactivated after quota reached (10 leads)', { filterId: filterId });
+            return true;
+        } catch (err) {
+            this._log('warn', 'Failed to deactivate filter in Supabase', { filterId: filterId, error: err.message });
+            return false;
+        }
+    }
+
+    /**
+     * Reactivates a filter (e.g. after 60s temporary deactivation or manual toggle).
+     * @param {string|number} filterId
+     * @returns {Promise<boolean>}
+     */
+    async reactivateFilter(filterId) {
+        if (!filterId) return false;
+        try {
+            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(filterId);
+            var body = {
+                is_active: true,
+                is_running: true,
+                updated_at: new Date().toISOString()
+            };
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            // Also update in-memory cache if present
+            if (Array.isArray(this._filters)) {
+                for (var i = 0; i < this._filters.length; i++) {
+                    if (String(this._filters[i].id) === String(filterId)) {
+                        this._filters[i].is_active = true;
+                        this._filters[i].is_running = true;
+                        break;
+                    }
+                }
+            }
+
+            this._log('info', 'Filter reactivated in Supabase', { filterId: filterId });
+            return true;
+        } catch (err) {
+            this._log('warn', 'Failed to reactivate filter in Supabase', { filterId: filterId, error: err.message });
+            return false;
+        }
+    }
+
+    // ============================================================
+    // LEADS - Check if exists
+    // ============================================================
+    /**
+     * @param {string} uniqueQueryId
+     * @returns {Promise<Object|null>}
+     */
+    async leadExists(uniqueQueryId) {
+        try {
+            var url = this.url + '/rest/v1/leads?unique_query_id=eq.' +
+                encodeURIComponent(uniqueQueryId) +
+                '&select=id,status,is_contacted&limit=1';
+            var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            var data = await response.json();
+            return data.length > 0 ? data[0] : null;
+        } catch (err) {
+            this._log('warn', 'Failed to check lead existence', { error: err.message, uniqueQueryId: uniqueQueryId });
+            return null;
+        }
+    }
+
+    // ============================================================
+    // LEADS - Insert (409-aware)
+    // ============================================================
+    /**
+     * Insert a lead. On 409 conflict, returns the existing row instead of throwing.
+     * @param {Object} lead
+     * @returns {Promise<{data: Object|null, conflict: boolean, existingId: number|string|null}>}
+     */
+    async insertLead(lead) {
+        var body = {
+            unique_query_id: lead.uniqueQueryId,
+            query_type: lead.queryType || 'BUY_LEAD',
+            query_time: lead.queryTime || new Date().toISOString(),
+            sender_name: lead.senderName || null,
+            sender_mobile: lead.senderMobile || null,
+            sender_mobile_alt: lead.senderMobileAlt || null,
+            sender_phone: lead.senderPhone || null,
+            sender_phone_alt: lead.senderPhoneAlt || null,
+            sender_email: lead.senderEmail || null,
+            sender_email_alt: lead.senderEmailAlt || null,
+            sender_company: lead.senderCompany || null,
+            sender_address: lead.senderAddress || null,
+            sender_city: lead.senderCity || null,
+            sender_state: lead.senderState || null,
+            sender_pincode: lead.senderPincode || null,
+            sender_country_iso: lead.senderCountryIso || null,
+            subject: lead.subject || null,
+            query_product_name: lead.queryProductName || null,
+            query_message: lead.queryMessage || null,
+            query_mcat_name: lead.queryMcatName || null,
+            call_duration: lead.callDuration || null,
+            receiver_mobile: lead.receiverMobile || null,
+            is_matched: lead.isMatched || false,
+            is_contacted: false,
+            status: 'new'
+        };
+
+        var crmOpId = 'op_crm_' + Date.now().toString(36);
+        var tCrm0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        this._log('info', 'crm.write.started', {
+            operationId: crmOpId,
+            traceId: lead.traceId || null,
+            context: { uniqueQueryId: lead.uniqueQueryId }
+        });
+
+        try {
+            var url = this.url + '/rest/v1/leads';
+            var response = await this._fetchWithTimeout(url, {
+                method: 'POST',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            var crmDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tCrm0;
+
+            if (response.status === 409) {
+                // Conflict — fetch existing row so caller can recover id
+                this._log('debug', '🔁 Lead already exists (409)', { uniqueQueryId: lead.uniqueQueryId });
+                var existing = await this.leadExists(lead.uniqueQueryId);
+                this._log('info', 'crm.write.completed', {
+                    operationId: crmOpId,
+                    traceId: lead.traceId || null,
+                    result: 'SUCCESS',
+                    reasonCode: 'DUPLICATE_ROW_RECOVERED',
+                    durationMs: crmDuration,
+                    context: { uniqueQueryId: lead.uniqueQueryId, id: existing ? existing.id : null }
+                });
+                return {
+                    data: existing,
+                    conflict: true,
+                    existingId: existing ? existing.id : null
+                };
+            }
+
+            if (!response.ok) {
+                var errorText = await response.text();
+                throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
+            }
+
+            var data = await response.json();
+            var row = data[0] || null;
+            this._log('info', 'crm.write.completed', {
+                operationId: crmOpId,
+                traceId: lead.traceId || null,
+                result: 'SUCCESS',
+                durationMs: crmDuration,
+                context: { uniqueQueryId: lead.uniqueQueryId, id: row && row.id }
+            });
+            return { data: row, conflict: false, existingId: null };
+        } catch (err) {
+            var failDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tCrm0;
+            this._log('error', 'crm.write.failed', {
+                operationId: crmOpId,
+                traceId: lead.traceId || null,
+                result: 'FAILURE',
+                reasonCode: err.message && err.message.indexOf('timeout') !== -1 ? 'CRM_TIMEOUT' : 'CRM_WRITE_ERROR',
+                durationMs: failDuration,
+                error: err
+            });
+            return { data: null, conflict: false, existingId: null, error: err.message };
+        }
+    }
+
+    // ============================================================
+    // LEADS - Update
+    // ============================================================
+    async updateLead(idOrUniqueQueryId, updates) {
+        try {
+            var url = this.url + '/rest/v1/leads?';
+            if (typeof idOrUniqueQueryId === 'number' || (typeof idOrUniqueQueryId === 'string' && /^\d+$/.test(idOrUniqueQueryId))) {
+                url += 'id=eq.' + idOrUniqueQueryId;
+            } else {
+                url += 'unique_query_id=eq.' + encodeURIComponent(idOrUniqueQueryId);
+            }
+            var body = Object.assign({}, updates, { updated_at: new Date().toISOString() });
+
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            this._log('debug', '✏️ Lead updated', { identifier: idOrUniqueQueryId, updates: updates });
+            return true;
+        } catch (err) {
+            this._log('error', '❌ Failed to update lead', { error: err.message, identifier: idOrUniqueQueryId });
+            return false;
+        }
+    }
+
+    async markLeadMatched(idOrUniqueQueryId) {
+        return this.updateLead(idOrUniqueQueryId, { is_matched: true, status: 'matched' });
+    }
+
+    async markLeadContacted(idOrUniqueQueryId) {
+        return this.updateLead(idOrUniqueQueryId, {
+            is_contacted: true,
+            status: 'contacted',
+            updated_at: new Date().toISOString()
+        });
+    }
+
+    // ============================================================
+    // LEAD HISTORY
+    // ============================================================
+    /**
+     * Insert a lead_history row. Non-blocking wrapper is provided by caller.
+     * @returns {Promise<boolean>}
+     */
+    async insertLeadHistory(leadId, action, details, contactedAt) {
+        try {
+            var url = this.url + '/rest/v1/lead_history';
+            var body = {
+                lead_id: leadId,
+                action: action,
+                action_details: typeof details === 'string' ? details : JSON.stringify(details || {}),
+                contacted_at: contactedAt || null
+            };
+
+            var response = await this._fetchWithTimeout(url, {
+                method: 'POST',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            this._log('debug', '📝 History added', { leadId: leadId, action: action });
+            return true;
+        } catch (err) {
+            this._log('warn', 'Failed to add history', { error: err.message });
+            return false;
+        }
+    }
+
+    // ============================================================
+    // STATS - Buffered updates
+    // ============================================================
+    /**
+     * Update filter stats. Buffered for 10s to avoid PATCH storms.
+     */
+    async updateFilterStats(scanned, matched, clicked) {
+        this._statsBuffer.scanned = scanned;
+        this._statsBuffer.matched = matched;
+        this._statsBuffer.clicked = clicked;
+
+        if (this._statsFlushTimer) return;
+        if (this._statsPending) return;
+
+        var self = this;
+        this._statsFlushTimer = setTimeout(function() {
+            self._statsFlushTimer = null;
+            self._flushStats();
+        }, 10000);
+    }
+
+    async _flushStats() {
+        // Skip if no filters cached — PATCH would match zero rows
+        if (!this._filters || this._filters.length === 0) {
+            this._statsPending = false;
+            return;
+        }
+
+        this._statsPending = true;
+        try {
+            var url = this.url + '/rest/v1/filters?is_active=eq.true';
+            var body = {
+                stats_scanned: this._statsBuffer.scanned,
+                stats_matched: this._statsBuffer.matched,
+                stats_clicked: this._statsBuffer.clicked,
+                updated_at: new Date().toISOString()
+            };
+
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (response.ok) {
+                this._log('debug', '📊 Stats flushed to DB', this._statsBuffer);
+            }
+            if (!response.ok) {
+                var errBody = '';
+                try { errBody = await response.text(); } catch (e) { }
+                this._log('debug', 'Stats flush non-OK response: HTTP ' + response.status + ' ' + errBody);
+            }
+        } catch (err) {
+            var errMsg = (err && err.message) ? err.message : String(err);
+            this._log('warn', 'Stats flush failed: ' + errMsg, { error: errMsg });
+        } finally {
+            this._statsPending = false;
+        }
+    }
+
+    // ============================================================
+    // BATCH - Fetch recent leads (for dedup cache)
+    // ============================================================
+    /**
+     * Fetch recent leads. Optionally filter by status.
+     * @param {number} limit
+     * @param {string[]} [statuses] - e.g. ['rejected','skipped']
+     * @returns {Promise<Array>}
+     */
+    async getRecentLeads(limit, statuses) {
+        limit = limit || 100;
+        try {
+            var url = this.url + '/rest/v1/leads?select=unique_query_id,status,is_contacted&order=created_at.desc&limit=' + limit;
+            if (Array.isArray(statuses) && statuses.length > 0) {
+                url += '&status=in.(' + statuses.map(function(s) { return encodeURIComponent(s); }).join(',') + ')';
+            }
+            var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            var data = await response.json();
+            return Array.isArray(data) ? data : [];
+        } catch (err) {
+            this._log('warn', 'Failed to fetch recent leads', { error: err.message });
+            return [];
+        }
+    }
+
+    // ============================================================
+    // DATA MANAGEMENT — CLEAR OPERATIONS
+    // ============================================================
+
+    async clearAllLeads() {
+        try {
+            var url = this.url + '/rest/v1/leads?id=gte.0';
+            var response = await this._fetchWithTimeout(url, {
+                method: 'DELETE',
+                headers: {
+                    'apikey': this.key,
+                    'Authorization': 'Bearer ' + this.key,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal'
+                }
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) {
+                var errorText = await response.text();
+                throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
+            }
+
+            this._log('warn', '🗑️ All leads deleted');
+            return { success: true, message: 'All leads deleted' };
+        } catch (err) {
+            this._log('error', '❌ Failed to clear leads', { error: err.message });
+            return { success: false, error: err.message };
+        }
+    }
+
+    async clearAllHistory() {
+        try {
+            var url = this.url + '/rest/v1/lead_history?id=gte.0';
+            var response = await this._fetchWithTimeout(url, {
+                method: 'DELETE',
+                headers: {
+                    'apikey': this.key,
+                    'Authorization': 'Bearer ' + this.key,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal'
+                }
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) {
+                var errorText = await response.text();
+                throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
+            }
+
+            this._log('warn', '🗑️ All history deleted');
+            return { success: true, message: 'All history deleted' };
+        } catch (err) {
+            this._log('error', '❌ Failed to clear history', { error: err.message });
+            return { success: false, error: err.message };
+        }
+    }
+
+    async resetFilterStats() {
+        try {
+            var url = this.url + '/rest/v1/filters?is_active=eq.true';
+            var body = {
+                stats_scanned: 0,
+                stats_matched: 0,
+                stats_clicked: 0,
+                is_running: false,
+                updated_at: new Date().toISOString()
+            };
+
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH',
+                headers: this.headers,
+                body: JSON.stringify(body)
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+
+            this._log('warn', '🔄 Filter stats reset');
+            return { success: true, message: 'Stats reset' };
+        } catch (err) {
+            this._log('error', 'Failed to reset stats', { error: err.message });
+            return { success: false, error: err.message };
+        }
+    }
+
+    async clearLeadsBefore(dateISO) {
+        if (!dateISO || typeof dateISO !== 'string') {
+            return { success: false, error: 'Missing date' };
+        }
+        if (!/^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]+)?$/.test(dateISO)) {
+            return { success: false, error: 'Invalid date format (expected YYYY-MM-DD or ISO)' };
+        }
+
+        try {
+            var url = this.url + '/rest/v1/leads?created_at=lt.' + encodeURIComponent(dateISO);
+            var response = await this._fetchWithTimeout(url, {
+                method: 'DELETE',
+                headers: {
+                    'apikey': this.key,
+                    'Authorization': 'Bearer ' + this.key,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal'
+                }
+            }, TIMEOUT_WRITE);
+
+            if (!response.ok) {
+                var errorText = await response.text();
+                throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
+            }
+
+            this._log('warn', '🗑️ Old leads deleted before ' + dateISO);
+            return { success: true, message: 'Old leads deleted' };
+        } catch (err) {
+            this._log('error', 'Failed to delete old leads', { error: err.message });
+            return { success: false, error: err.message };
+        }
+    }
+
+    async getTableCounts() {
+        try {
+            var countHeaders = {
+                'apikey': this.key,
+                'Authorization': 'Bearer ' + this.key,
+                'Range': '0-0',
+                'Prefer': 'count=exact'
+            };
+
+            var results = await Promise.all([
+                this._fetchWithTimeout(this.url + '/rest/v1/leads?select=id',        { headers: countHeaders }, TIMEOUT_READ),
+                this._fetchWithTimeout(this.url + '/rest/v1/lead_history?select=id', { headers: countHeaders }, TIMEOUT_READ),
+                this._fetchWithTimeout(this.url + '/rest/v1/filters?select=id',      { headers: countHeaders }, TIMEOUT_READ)
+            ]);
+
+            return {
+                success: true,
+                leads:   this._extractCount(results[0]),
+                history: this._extractCount(results[1]),
+                filters: this._extractCount(results[2])
+            };
+        } catch (err) {
+            this._log('warn', 'Failed to get table counts', { error: err.message });
+            return { success: false, error: err.message };
+        }
+    }
+
+    /**
+     * Extract count from a PostgREST response header.
+     * Handles both `Range: 0-0` + `Prefer: count=exact` and plain `content-range`.
+     * Returns '?' if header is missing/malformed.
+     */
+    _extractCount(response) {
+        try {
+            if (!response || !response.headers || typeof response.headers.get !== 'function') return '?';
+            var range = response.headers.get('content-range') || response.headers.get('Content-Range');
+            if (range) {
+                // Format: "0-0/123" or "*/123" or "0-9/*"
+                var parts = range.split('/');
+                if (parts[1] && parts[1] !== '*') {
+                    var n = parseInt(parts[1], 10);
+                    return isNaN(n) ? '?' : n;
+                }
+            }
+            return '?';
+        } catch (e) {
+            return '?';
+        }
+    }
+
+    // ============================================================
+    // HEALTH CHECK
+    // ============================================================
+    /**
+     * Ping the REST endpoint. 5s timeout.
+     * @returns {Promise<boolean>}
+     */
+    async healthCheck() {
+        try {
+            var response = await this._fetchWithTimeout(
+                this.url + '/rest/v1/filters?select=id&limit=1',
+                { headers: this.headers },
+                TIMEOUT_HEALTH
+            );
+            return response.ok;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    /**
+     * Force-refresh filters cache.
+     * @returns {Promise<Array>}
+     */
+    async refresh() {
+        this._filtersLastFetch = 0;
+        this._filtersLoaded = false;
+        return await this.loadFilters(true);
+    }
+}
+
+// Export to window for content-script consumption and module for Node testing
+if (typeof window !== 'undefined') window.SupabaseService = SupabaseService;
+if (typeof module !== 'undefined' && module.exports) module.exports = SupabaseService;

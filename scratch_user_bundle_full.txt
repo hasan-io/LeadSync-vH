@@ -1,0 +1,12 @@
+<USER_REQUEST>
+do the same with this bundle as we did with the earlier one
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-23T17:36:27+05:30.
+
+The user's current state is as follows:
+Active Document: c:\Users\Asus\Documents\LeadSync-IndiaMart Extension\LeadSync-Extension\LeadSync-v5.0\src\bundle.js (LANGUAGE_JAVASCRIPT)
+Cursor is on line: 205
+Other open documents:
+- c:\Users\Asus\Documents\LeadSync-IndiaMart Extension\LeadSync-Extension\LeadSync-v5.0\src\bundle.js (LANGUAGE_JAVASCRIPT)
+</ADDITIONAL_METADATA>

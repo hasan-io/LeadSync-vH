@@ -1,0 +1,101 @@
+{
+  "manifest_version": 3,
+  "name": "IndiaMART BuyLead Assistant",
+  "version": "5.0.0",
+  "description": "Reliable BuyLead monitoring, filter matching, and review assistant with Supabase CRM integration.",
+  "homepage_url": "https://leadsync-tau-sand.vercel.app/",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "tabs",
+    "alarms",
+    "notifications",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "https://seller.indiamart.com/*",
+    "https://app.indiamart.com/*",
+    "https://zvhuromubukylsxrsfiz.supabase.co/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://seller.indiamart.com/bltxn/*",
+        "https://seller.indiamart.com/bltxn",
+        "https://app.indiamart.com/buyleads*",
+        "https://app.indiamart.com/buyleads"
+      ],
+      "js": ["src/network-interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://seller.indiamart.com/bltxn/*",
+        "https://seller.indiamart.com/bltxn",
+        "https://app.indiamart.com/buyleads*",
+        "https://app.indiamart.com/buyleads"
+      ],
+      "js": [
+        "src/supabase-service.js",
+        "src/bundle.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "action": {
+    "default_popup": "popup/index.html",
+    "default_title": "BuyLead Assistant",
+    "default_icon": {
+      "16": "plugin.png",
+      "32": "plugin.png",
+      "48": "plugin.png",
+      "128": "plugin.png"
+    }
+  },
+  "icons": {
+    "16": "plugin.png",
+    "32": "plugin.png",
+    "48": "plugin.png",
+    "128": "plugin.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "plugin.png",
+        "config/index.html",
+        "config/config.js",
+        "config/style.css",
+        "debug/index.html",
+        "debug/debug.js",
+        "src/network-interceptor.js"
+      ],
+      "matches": [
+        "https://seller.indiamart.com/*",
+        "https://app.indiamart.com/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "incognito": "not_allowed",
+  "externally_connectable": {
+    "matches": [
+      "https://seller.indiamart.com/*",
+      "https://app.indiamart.com/*"
+    ]
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  }
+}

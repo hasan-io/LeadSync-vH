@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Debug - BuyLead Assistant</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --bg: #ffffff;
+            --bg-subtle: #fafafa;
+            --bg-hover: #f4f4f5;
+            --border: #e4e4e7;
+            --border-strong: #d4d4d8;
+            --text: #18181b;
+            --text-2: #52525b;
+            --text-3: #a1a1aa;
+            --accent: #0d9488;
+            --accent-bg: #f0fdfa;
+            --success: #059669;
+            --success-bg: #ecfdf5;
+            --warning: #d97706;
+            --warning-bg: #fffbeb;
+            --danger: #dc2626;
+            --danger-bg: #fef2f2;
+            --purple: #7c3aed;
+            --purple-bg: #f5f3ff;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg-subtle);
+            color: var(--text);
+            padding: 20px 24px 24px;
+            min-height: 100vh;
+            font-size: 13px;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* HEADER */
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 16px; padding-bottom: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        .header-left { display: flex; align-items: center; gap: 12px; }
+        .header-icon-img { width: 32px; height: 32px; object-fit: contain; border-radius: 6px; flex-shrink: 0; }
+        .header-text { display: flex; flex-direction: column; }
+        .header h1 { font-size: 18px; color: var(--text); font-weight: 600; line-height: 1.2; letter-spacing: -0.02em; }
+        .header .subtitle { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+        .header .status { font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 12px; font-variant-numeric: tabular-nums; }
+        .header .status #liveIndicator { color: var(--success); font-weight: 600; }
+
+        /* CATEGORY TABS */
+        .category-tabs {
+            display: flex; gap: 8px; margin-bottom: 12px;
+        }
+        .tab-btn {
+            padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border);
+            background: var(--bg); color: var(--text-2); font-weight: 600; font-size: 12px;
+            cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+            font-family: inherit; transition: all 0.15s ease;
+        }
+        .tab-btn:hover { background: var(--bg-hover); color: var(--text); }
+        .tab-btn.active {
+            background: var(--text); color: #fff; border-color: var(--text);
+        }
+        .tab-badge {
+            font-size: 11px; padding: 1px 7px; border-radius: 10px;
+            background: var(--bg-hover); color: var(--text-2); font-variant-numeric: tabular-nums;
+        }
+        .tab-btn.active .tab-badge {
+            background: rgba(255, 255, 255, 0.2); color: #fff;
+        }
+        .tab-badge.success {
+            background: #ecfdf5; color: #059669;
+        }
+        .tab-btn.active .tab-badge.success {
+            background: #10b981; color: #fff;
+        }
+
+        /* ACQUISITION LOG CARDS */
+        .acq-card {
+            padding: 12px 14px; border-bottom: 1px solid var(--border);
+            display: flex; flex-direction: column; gap: 8px;
+            background: var(--bg); transition: background 0.12s ease;
+        }
+        .acq-card:hover { background: #fafafa; }
+        .acq-card:last-child { border-bottom: none; }
+        .acq-card-header {
+            display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        }
+        .acq-card-title {
+            font-size: 14px; font-weight: 600; color: var(--text);
+            display: flex; align-items: center; gap: 8px;
+        }
+        .acq-status-badge {
+            font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;
+            letter-spacing: 0.02em; display: inline-flex; align-items: center; gap: 4px;
+        }
+        .acq-status-SUCCESS { background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; }
+        .acq-status-FAILED  { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+        .acq-status-BLOCKED { background: #fffbeb; color: #d97706; border: 1px solid #fde68a; }
+        .acq-meta-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 6px 14px; font-size: 12px; color: var(--text-2);
+        }
+        .acq-meta-item strong { color: var(--text); }
+        .acq-chips {
+            display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px;
+        }
+        .acq-chip {
+            font-size: 10.5px; padding: 2px 6px; border-radius: 4px;
+            background: var(--bg-hover); color: var(--text-2); border: 1px solid var(--border);
+        }
+        .acq-chip.matched { background: #f0fdfa; color: #0f766e; border-color: #99f6e4; font-weight: 600; }
+        .acq-banner {
+            background: #f0fdfa; border: 1px solid #99f6e4; color: #0f766e;
+            padding: 10px 14px; border-radius: 6px; margin-bottom: 12px;
+            font-size: 12px; display: flex; align-items: center; justify-content: space-between;
+        }
+
+        /* STATS BAR */
+        .stats-bar {
+            display: flex; gap: 16px; margin-bottom: 10px; padding: 8px 12px;
+            background: var(--bg); border-radius: 6px; font-size: 12px; flex-wrap: wrap;
+            border: 1px solid var(--border);
+        }
+        .stats-bar span { color: var(--text-2); }
+        .stats-bar strong { color: var(--text); font-variant-numeric: tabular-nums; }
+
+        /* STICKY FILTER BAR */
+        .controls {
+            display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+            padding: 10px 0; margin-bottom: 12px;
+            position: sticky; top: 0; z-index: 100;
+            background: var(--bg-subtle);
+            border-bottom: 1px solid var(--border);
+        }
+        .controls select,
+        .controls input {
+            padding: 6px 10px; border-radius: 5px;
+            border: 1px solid var(--border); background: var(--bg);
+            color: var(--text); font-size: 12px; font-family: inherit;
+            transition: border-color 0.12s ease;
+        }
+        .controls select:focus,
+        .controls input:focus {
+            outline: none; border-color: var(--text-2);
+        }
+        .controls button {
+            padding: 6px 12px; border: 1px solid transparent; border-radius: 5px;
+            cursor: pointer; font-weight: 600; font-size: 12px;
+            font-family: inherit; transition: all 0.12s ease;
+            display: inline-flex; align-items: center; gap: 5px;
+        }
+        .controls button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-primary   { background: var(--text); color: #fff; }
+        .btn-primary:hover:not(:disabled)   { background: #000; }
+        .btn-danger    { background: var(--danger-bg); color: var(--danger); border-color: #fecaca; }
+        .btn-danger:hover:not(:disabled)    { background: #fee2e2; }
+        .btn-secondary { background: var(--bg); color: var(--text-2); border-color: var(--border); }
+        .btn-secondary:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+
+        /* LOG CONTAINER */
+        .log-container {
+            background: var(--bg); border-radius: 6px;
+            max-height: 74vh; overflow-y: auto;
+            border: 1px solid var(--border);
+        }
+        .log-container::-webkit-scrollbar { width: 8px; }
+        .log-container::-webkit-scrollbar-track { background: var(--bg-subtle); }
+        .log-container::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+        .log-container::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+        /* LOG ROW */
+        .log-entry {
+            padding: 6px 12px; border-bottom: 1px solid var(--border);
+            font-size: 12px; display: flex; align-items: center; gap: 10px;
+            font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+            flex-wrap: wrap;
+        }
+        .log-entry:hover { background: var(--bg-subtle); }
+        .log-entry:last-child { border-bottom: none; }
+
+        .log-level {
+            font-weight: 700; min-width: 55px; text-align: center;
+            padding: 1px 6px; border-radius: 3px; font-size: 10px; flex-shrink: 0;
+            border: 1px solid transparent;
+        }
+        .level-TRACE { color: var(--text-3);  background: var(--bg-hover); border-color: var(--border); }
+        .level-DEBUG { color: #6366f1;       background: #eef2ff;         border-color: #c7d2fe; }
+        .level-INFO  { color: var(--accent);  background: var(--accent-bg); border-color: #99f6e4; }
+        .level-WARN  { color: var(--warning); background: var(--warning-bg); border-color: #fde68a; }
+        .level-ERROR { color: var(--danger);  background: var(--danger-bg); border-color: #fecaca; }
+        .level-FATAL { color: #fff; background: var(--danger); border-color: var(--danger); }
+
+        .log-time { color: var(--text-3); font-size: 11px; min-width: 130px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+        .log-module { color: var(--text-2); min-width: 85px; flex-shrink: 0; font-size: 11px; font-weight: 500; }
+        .log-message { flex: 1; color: var(--text); word-break: break-word; min-width: 200px; }
+
+        .log-extra {
+            display: inline-block; color: var(--text-2);
+            background: var(--bg-hover); padding: 1px 6px;
+            border-radius: 3px; font-size: 10px; margin-left: 6px;
+            max-width: 220px; overflow: hidden;
+            text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;
+        }
+        .log-reason {
+            display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 10px; margin-left: 6px; background: var(--bg-hover);
+            font-weight: 600; vertical-align: middle;
+        }
+
+        .log-data {
+            color: var(--text-3); font-size: 10px; max-width: 260px;
+            overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; flex-shrink: 0;
+            font-family: ui-monospace, monospace;
+        }
+        .trace-badge {
+            display: inline-block; color: #0284c7; background: #e0f2fe;
+            border: 1px solid #bae6fd; padding: 1px 5px; border-radius: 3px;
+            font-size: 10px; cursor: pointer; text-decoration: none;
+            transition: all 0.12s ease; margin-right: 5px;
+        }
+        .trace-badge:hover { background: #bae6fd; text-decoration: underline; }
+        .duration-badge {
+            display: inline-block; color: #4b5563; background: #f3f4f6;
+            padding: 1px 5px; border-radius: 3px; font-size: 10px;
+            font-variant-numeric: tabular-nums; margin-right: 5px;
+        }
+        .event-badge {
+            display: inline-block; color: #4338ca; background: #e0e7ff;
+            border: 1px solid #c7d2fe; padding: 1px 5px; border-radius: 3px;
+            font-size: 10px; font-weight: 600; margin-right: 5px;
+        }
+        /* Filter lifecycle event badges */
+        .event-badge-limit    { display: inline-block; color: #92400e; background: #fef3c7; border: 1px solid #fcd34d; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 700; margin-right: 5px; }
+        .event-badge-deact    { display: inline-block; color: #991b1b; background: #fee2e2; border: 1px solid #fca5a5; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 700; margin-right: 5px; }
+        .event-badge-react    { display: inline-block; color: #065f46; background: #d1fae5; border: 1px solid #6ee7b7; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 700; margin-right: 5px; }
+        /* Row-level highlight strips for filter lifecycle events */
+        .log-entry.filter-limit   { border-left: 3px solid #f59e0b; background: #fffbeb; }
+        .log-entry.filter-deact   { border-left: 3px solid #ef4444; background: #fff1f2; }
+        .log-entry.filter-react   { border-left: 3px solid #10b981; background: #f0fdf4; }
+        .log-entry.filter-limit:hover { background: #fef3c7; }
+        .log-entry.filter-deact:hover { background: #fee2e2; }
+        .log-entry.filter-react:hover { background: #d1fae5; }
+        .result-badge {
+            display: inline-block; padding: 1px 5px; border-radius: 3px;
+            font-size: 10px; font-weight: 700; margin-right: 5px;
+        }
+        .log-reason {
+            display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 10px; margin-right: 5px; background: var(--bg-hover);
+            font-weight: 600; vertical-align: middle;
+        }
+        .log-buttons { display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; }
+        .expand-btn {
+            background: none; border: none; color: var(--text-3);
+            cursor: pointer; font-size: 10px; padding: 3px 6px;
+            border-radius: 3px; transition: color 0.12s ease;
+        }
+        .expand-btn:hover { background: var(--bg-hover); color: var(--text); }
+        .copy-btn {
+            background: none; border: none; color: var(--text-3);
+            cursor: pointer; font-size: 11px; padding: 3px 6px;
+            border-radius: 3px; transition: all 0.12s ease;
+        }
+        .copy-btn:hover { color: var(--accent); background: var(--bg-hover); }
+
+        .log-data-chips {
+            display: inline-flex; flex-wrap: wrap; gap: 4px;
+            align-items: center; max-width: 480px; flex-shrink: 1;
+        }
+        .data-chip {
+            display: inline-flex; align-items: center; background: var(--bg-hover);
+            border: 1px solid var(--border); border-radius: 3px;
+            padding: 1px 5px; font-size: 10px; color: var(--text-2);
+            white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+        }
+        .data-chip-key { color: var(--text-3); margin-right: 3px; font-weight: 500; }
+        .data-chip-val { color: var(--text); font-weight: 600; }
+
+        .log-data-full {
+            display: none; width: 100%; padding: 12px 14px; margin-top: 8px;
+            background: #ffffff; border: 1px solid var(--border); border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            border-left: 3px solid var(--accent);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        .log-data-full.show { display: block; }
+
+        .log-structured-card { display: flex; flex-direction: column; gap: 10px; }
+        .log-meta-row {
+            display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+            padding-bottom: 8px; border-bottom: 1px solid var(--border);
+        }
+        .log-meta-item {
+            display: inline-flex; align-items: center; font-size: 11px; gap: 5px;
+            background: var(--bg-subtle); padding: 3px 8px; border-radius: 4px;
+            border: 1px solid var(--border);
+        }
+        .log-meta-label {
+            color: var(--text-3); text-transform: uppercase; font-size: 9px;
+            font-weight: 700; letter-spacing: 0.05em;
+        }
+        .log-meta-val { color: var(--text); font-weight: 600; font-family: ui-monospace, monospace; }
+
+        .log-section-title {
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; color: var(--text-3); margin-bottom: 4px;
+        }
+        .log-kv-table {
+            width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 4px;
+        }
+        .log-kv-table th, .log-kv-table td {
+            padding: 5px 8px; text-align: left; border-bottom: 1px solid var(--bg-hover);
+        }
+        .log-kv-table th {
+            width: 160px; color: var(--text-2); font-weight: 600;
+            background: var(--bg-subtle); font-family: ui-monospace, monospace; font-size: 10px;
+        }
+        .log-kv-table td { color: var(--text); word-break: break-word; font-family: ui-monospace, monospace; }
+
+        .raw-json-toggle {
+            background: none; border: none; color: var(--text-3); font-size: 11px;
+            cursor: pointer; padding: 4px 0; text-decoration: underline; align-self: flex-start;
+            font-family: inherit;
+        }
+        .raw-json-toggle:hover { color: var(--accent); }
+        .raw-json-block {
+            display: none; background: var(--bg-subtle); padding: 8px 10px;
+            border-radius: 4px; border: 1px solid var(--border); font-family: ui-monospace, monospace;
+            font-size: 11px; white-space: pre-wrap; word-break: break-all;
+            color: var(--text-2); max-height: 250px; overflow-y: auto; margin-top: 4px;
+        }
+        .raw-json-block.show { display: block; }
+
+        /* EMPTY */
+        .empty {
+            text-align: center; color: var(--text-3);
+            padding: 60px 20px; font-size: 13px; line-height: 1.6;
+        }
+        .empty-icon { font-size: 32px; display: block; margin-bottom: 12px; opacity: 0.5; }
+
+        /* FOOTER */
+        .footer {
+            margin-top: 16px; display: flex; justify-content: space-between;
+            font-size: 11px; color: var(--text-3); flex-wrap: wrap; gap: 8px;
+        }
+        .footer a { color: var(--text-2); text-decoration: none; cursor: pointer; font-weight: 500; }
+        .footer a:hover { color: var(--text); }
+
+        .credit {
+            text-align: center; margin-top: 14px; padding-top: 12px;
+            border-top: 1px solid var(--border); font-size: 10px; color: var(--text-3);
+        }
+        .credit a { color: var(--accent); text-decoration: none; }
+        .credit a:hover { text-decoration: underline; }
+
+        /* TOAST */
+        .toast {
+            position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+            background: var(--text); color: #fff; padding: 10px 20px;
+            border-radius: 5px; font-size: 12px; z-index: 9999;
+            max-width: 90%; text-align: center; font-weight: 500;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+        }
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateX(-50%) translateY(12px); }
+            to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        @keyframes fadeOutDown {
+            from { opacity: 1; transform: translateX(-50%) translateY(0); }
+            to   { opacity: 0; transform: translateX(-50%) translateY(12px); }
+        }
+
+        @media (max-width: 700px) {
+            body { padding: 14px; }
+            .controls select, .controls input { font-size: 11px; padding: 5px 8px; }
+            .controls button { padding: 5px 10px; font-size: 11px; }
+            .log-time { min-width: 100px; font-size: 10px; }
+            .log-module { min-width: 70px; }
+            .log-data { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            <img src="../plugin.png" alt="BuyLead Assistant" class="header-icon-img" />
+            <div class="header-text">
+                <h1>Debug Logs &amp; Observability</h1>
+                <span class="subtitle">Lead Sync Assistant v6.3.0</span>
+            </div>
+        </div>
+        <div class="status">
+            <span id="logCount">0 entries</span>
+            <span id="liveIndicator">Live</span>
+        </div>
+    </div>
+
+    <div class="category-tabs">
+        <button class="tab-btn active" id="tabAllLogs" type="button">
+            <span>📋 System Diagnostic Logs (1,000 max)</span>
+            <span class="tab-badge" id="tabAllLogsBadge">0</span>
+        </button>
+        <button class="tab-btn" id="tabAcquisitions" type="button">
+            <span>🎯 Matched Lead Acquisitions (Session Persistent)</span>
+            <span class="tab-badge success" id="tabAcquisitionsBadge">0</span>
+        </button>
+    </div>
+
+    <!-- SYSTEM LOGS VIEW -->
+    <div id="systemLogsView">
+        <div class="stats-bar">
+            <span>Total: <strong id="statTotal">0</strong></span>
+            <span>INFO: <strong id="statInfo">0</strong></span>
+            <span>WARN: <strong id="statWarn">0</strong></span>
+            <span>ERROR: <strong id="statError">0</strong></span>
+            <span>DEBUG: <strong id="statDebug">0</strong></span>
+            <span>Scans: <strong id="statScans">0</strong></span>
+            <span>Obs: <strong id="statObs">0</strong></span>
+            <span>Dups: <strong id="statDups">0</strong></span>
+            <span>Rejected: <strong id="statRejected">0</strong></span>
+            <span>CRM: <strong id="statCrm">0</strong></span>
+            <span>Dropped: <strong id="statDropped" style="color:var(--danger)">0</strong></span>
+        </div>
+    </div>
+
+    <!-- MATCHED ACQUISITIONS VIEW -->
+    <div id="acquisitionsView" style="display:none;">
+        <div class="acq-banner">
+            <span>🎯 <strong>Verified Matchmaking Acquisitions:</strong> Displays leads that strictly passed verified filter matchmaking and were attempted for acquisition. These records are <strong>never dropped or trimmed</strong> (no 1,000 log cap) and stay for the entire browser session.</span>
+        </div>
+
+        <div class="stats-bar" style="background:#f8fafc; border-color:#cbd5e1; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+            <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+                <span>Total Matched Attempts: <strong id="acqStatTotal">0</strong></span>
+                <span>✅ Success: <strong id="acqStatSuccess" style="color:var(--success)">0</strong></span>
+                <span>❌ Failed: <strong id="acqStatFailed" style="color:var(--danger)">0</strong></span>
+                <span>🛑 Blocked: <strong id="acqStatBlocked" style="color:var(--warning)">0</strong></span>
+                <span>Success Rate: <strong id="acqStatRate">0%</strong></span>
+            </div>
+            <button class="btn-danger" id="acqClearStatsBarBtn" type="button" style="margin-left:auto; padding:4px 12px; font-size:12px; height:28px; display:inline-flex; align-items:center; gap:6px; cursor:pointer; border-radius:5px; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,0.05);" title="Clear all matched acquisition records in this section">
+                🗑️ Clear All
+            </button>
+        </div>
+
+        <div class="controls" style="margin-top:-4px;">
+            <select id="acqStatusFilter">
+                <option value="ALL">All Outcomes</option>
+                <option value="SUCCESS">✅ SUCCESS Only</option>
+                <option value="FAILED">❌ FAILED Only</option>
+                <option value="BLOCKED">🛑 BLOCKED Only</option>
+            </select>
+
+            <select id="acqCountryFilter">
+                <option value="ALL">All Countries</option>
+            </select>
+
+            <input type="text" id="acqSearchFilter" placeholder="Search product, seller, buyer phone, filter..." style="width:260px;">
+
+            <button class="btn-primary" id="acqApplyFilter">Filter</button>
+            <button class="btn-secondary" id="acqClearFilter">Reset Filter</button>
+            <button class="btn-primary" id="acqExportBtn" style="background:#0d9488;">Export Acquisitions (CSV/JSON)</button>
+            <button class="btn-danger" id="acqClearSessionBtn">Clear Session Records</button>
+        </div>
+
+        <div class="log-container" id="acqContainer">
+            <div class="empty">
+                <span class="empty-icon">🎯</span>
+                No verified matched acquisitions recorded yet in this session.
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <select id="levelFilter">
+            <option value="ALL">All Levels</option>
+            <option value="TRACE">TRACE</option>
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO">INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+            <option value="FATAL">FATAL</option>
+        </select>
+
+        <select id="eventFilter">
+            <option value="ALL">All Events</option>
+        </select>
+
+        <select id="moduleFilter">
+            <option value="ALL">All Components</option>
+        </select>
+
+        <select id="reasonFilter">
+            <option value="ALL">All Reasons</option>
+        </select>
+
+        <select id="countryFilter">
+            <option value="ALL">All Country Events</option>
+        </select>
+
+        <input type="text" id="traceFilter" placeholder="Filter by Trace ID..." style="width:140px;">
+        <input type="text" id="searchFilter" placeholder="Search logs..." style="width:160px;">
+
+        <button class="btn-primary"   id="applyFilter">Apply</button>
+        <button class="btn-secondary" id="clearFilter">Clear</button>
+        <button class="btn-secondary" id="refreshBtn">Refresh</button>
+        <button class="btn-secondary" id="autoRefreshBtn">Pause Auto</button>
+        <button class="btn-primary"   id="exportBtn">Export</button>
+        <button class="btn-danger"    id="clearBtn">Clear All</button>
+    </div>
+
+    <div class="log-container" id="logContainer">
+        <div class="empty">
+            <span class="empty-icon">...</span>
+            Loading logs...
+        </div>
+    </div>
+
+    <div class="footer">
+        <span>Logs stored locally · Max 500 entries · Auto-refresh 1.2s</span>
+        <a id="backLink">Back to Dashboard</a>
+    </div>
+
+    <div class="credit">
+        Developed by <a href="https://leadsync-tau-sand.vercel.app/" target="_blank">Keyn Labs</a> — Debug v6.2.0
+    </div>
+
+    <script src="debug.js"></script>
+</body>
+</html>

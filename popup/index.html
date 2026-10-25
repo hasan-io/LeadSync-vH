@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>BuyLead Assistant</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="header-brand">
+                <img src="../plugin.png" alt="BuyLead Assistant" class="brand-icon" width="24" height="24" />
+                <div class="title">Lead Sync Assistant</div>
+            </div>
+            <span class="badge" id="modeBadge">AUTOMATIC</span>
+        </div>
+
+        <!-- Supabase Mode Toggle -->
+        <div class="connection-toggle" id="connectionToggle">
+            <div class="connection-left">
+                <div class="connection-icon" id="connectionIcon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+                </div>
+                <div class="connection-info">
+                    <div class="connection-label" id="connectionLabel">Supabase: <strong>ON</strong></div>
+                    <div class="connection-status" id="connectionStatus">Connected to CRM</div>
+                </div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="supabaseToggle" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <!-- Strict Country Toggle -->
+        <div class="connection-toggle" id="strictCountryWrap">
+            <div class="connection-left">
+                <div class="connection-icon" id="strictCountryIcon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                </div>
+                <div class="connection-info">
+                    <div class="connection-label" id="strictCountryLabel">Strict Country: <strong>OFF</strong></div>
+                    <div class="connection-status" id="strictCountryStatus">All countries accepted</div>
+                </div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="strictCountryToggle">
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <!-- Confirmation Answer Toggle -->
+        <div class="connection-toggle" id="confirmToggleWrap">
+            <div class="connection-left">
+                <div class="connection-icon" id="confirmIcon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                </div>
+                <div class="connection-info">
+                    <div class="connection-label" id="confirmLabel">Old Lead Confirmation: <strong>YES</strong></div>
+                    <div class="connection-status" id="confirmStatus">Auto-answer to "Do you want to contact?"</div>
+                </div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="confirmToggle" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <!-- Auto-Minimize Toggle -->
+        <div class="connection-toggle" id="autoMinToggleWrap">
+            <div class="connection-left">
+                <div class="connection-icon" id="autoMinIcon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                </div>
+                <div class="connection-info">
+                    <div class="connection-label" id="autoMinLabel">Auto-Handle Popups: <strong>ON</strong></div>
+                    <div class="connection-status" id="autoMinStatus">Popup handled automatically after acquisition</div>
+                </div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="autoMinToggle" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <!-- Purchase Modal Toggle -->
+        <div class="connection-toggle" id="purchaseToggleWrap">
+            <div class="connection-left">
+                <div class="connection-icon" id="purchaseIcon">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/></svg>
+                </div>
+                <div class="connection-info">
+                    <div class="connection-label" id="purchaseLabel">Purchase Modal: <strong>Auto-Close</strong></div>
+                    <div class="connection-status" id="purchaseStatus">Auto-close and continue</div>
+                </div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="purchaseToggle" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+
+        <!-- Status Grid -->
+        <div class="status-grid">
+            <div class="status-item">
+                <div class="status-label">Status</div>
+                <div class="status-value" id="statusText">Starting...</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Queue</div>
+                <div class="status-value" id="queueStatus">0</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Safety</div>
+                <div class="status-value" id="safetyStatus">OK</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Acquired</div>
+                <div class="status-value" id="acquiredCount">0</div>
+            </div>
+        </div>
+
+        <!-- Mode Controls -->
+        <div class="section-title">Operating Mode</div>
+        <div class="mode-grid">
+            <button type="button" class="mode-btn mode-monitor" data-mode="MONITOR" id="modeMonitor">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+                Monitor
+            </button>
+            <button type="button" class="mode-btn mode-dryrun" data-mode="DRY_RUN" id="modeDryRun">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3h15"/><path d="M6 3v16a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V3"/><path d="M6 14h12"/></svg>
+                Dry Run
+            </button>
+            <button type="button" class="mode-btn mode-assisted" data-mode="ASSISTED" id="modeAssisted">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                Assisted
+            </button>
+            <button type="button" class="mode-btn mode-automatic active" data-mode="AUTOMATIC" id="modeAutomatic">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                Auto
+            </button>
+        </div>
+
+        <!-- Auto-Start Notice -->
+        <div class="auto-notice" id="autoNotice">
+            <span class="pulse-dot"></span>
+            <span>Auto-acquiring enabled</span>
+        </div>
+
+        <!-- Stats -->
+<div class="stats-compact" id="statsCompact">
+    <div class="stats-summary" id="statsSummary">
+        <span class="stats-title">Statistics</span>
+        <span class="stats-inline" id="statsInline">0 scanned · 0 acquired</span>
+        <svg class="stats-chevron" id="statsChevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+    <div class="stats-expanded" id="statsExpanded" style="display:none;">
+        <div class="stat-row"><span class="stat-label">Discovered</span><span class="stat-value" id="statDiscovered">0</span></div>
+        <div class="stat-row"><span class="stat-label">Validated</span><span class="stat-value" id="statValidated">0</span></div>
+        <div class="stat-row"><span class="stat-label">Scored</span><span class="stat-value" id="statScored">0</span></div>
+        <div class="stat-row"><span class="stat-label">Queued</span><span class="stat-value" id="statQueued">0</span></div>
+        <div class="stat-row"><span class="stat-label">Acquired</span><span class="stat-value" id="statAcquired">0</span></div>
+        <div class="stat-row"><span class="stat-label">Rejected</span><span class="stat-value stat-danger" id="statRejected">0</span></div>
+        <div class="stat-row"><span class="stat-label">Country Blocked</span><span class="stat-value stat-warning" id="statCountryBlocked">0</span></div>
+        <div class="stat-row"><span class="stat-label">Duplicate</span><span class="stat-value stat-warning" id="statDuplicate">0</span></div>
+        <div class="stat-row"><span class="stat-label">Popups Handled</span><span class="stat-value stat-purple" id="statPopups">0</span></div>
+    </div>
+</div>
+
+        <!-- Emergency -->
+        <div style="display:flex;gap:6px;margin-top:10px;">
+            <button class="btn-danger" id="emergencyBtn" style="flex:1;">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+                Emergency Stop
+            </button>
+            <button class="btn-resume" id="resumeBtn" style="flex:1;display:none;">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                Resume
+            </button>
+        </div>
+        <!-- Open CRM -->
+        <button class="btn-crm" id="crmBtn">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+            Open CRM
+        </button>
+        <!-- Footer -->
+        <div class="footer">
+            <a id="configLink">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                Config
+            </a>
+            <a id="debugLink">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="6"/><path d="M12 7V3"/><path d="M6 13H2"/><path d="M22 13h-4"/><path d="M7 8 4 5"/><path d="M17 8l3-3"/><path d="M7 18l-3 3"/><path d="M17 18l3 3"/></svg>
+                Debug
+            </a>
+            <span class="version">v5.0.0</span>
+        </div>
+
+        <!-- Developer Credit -->
+        <div class="dev-credit">
+            Developed by <a href="https://leadsync-tau-sand.vercel.app/" target="_blank">Keyn Labs</a>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+</html>

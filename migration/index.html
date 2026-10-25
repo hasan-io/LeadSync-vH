@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Supabase Migration Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-left">
+                <div class="header-icon">🔄</div>
+                <div>
+                    <h1>Supabase Migration Dashboard</h1>
+                    <div class="subtitle">IndiaMART BuyLead Assistant — Database Setup</div>
+                </div>
+            </div>
+            <span class="badge">v5.1.1</span>
+        </div>
+
+        <div class="warning">
+            <strong>⚠️ IMPORTANT:</strong> This dashboard connects <strong>directly to your Supabase database</strong>. 
+            The migration will modify your <code>filters</code> table schema and populate keyword fields. 
+            Everything is safe and reversible. No data will be deleted.
+        </div>
+
+        <!-- STEP 1 -->
+        <div class="step" id="step1">
+            <div class="step-header">
+                <div class="step-left">
+                    <div class="step-number">1</div>
+                    <div>
+                        <div class="step-title">Test Connection</div>
+                        <div class="step-desc">Verify we can read from your Supabase database</div>
+                    </div>
+                </div>
+                <span class="step-status" id="step1-status">PENDING</span>
+            </div>
+            <div class="step-actions">
+                <button class="btn btn-primary" id="step1-btn" data-action="runStep1">▶ Run Test</button>
+            </div>
+            <div class="log" id="step1-log"></div>
+            <div class="result-box" id="step1-result"></div>
+        </div>
+
+        <!-- STEP 2 -->
+        <div class="step" id="step2">
+            <div class="step-header">
+                <div class="step-left">
+                    <div class="step-number">2</div>
+                    <div>
+                        <div class="step-title">Add Keyword Columns</div>
+                        <div class="step-desc">Adds product_keywords, negative_keywords, required_keywords, location_keywords to filters table</div>
+                    </div>
+                </div>
+                <span class="step-status" id="step2-status">PENDING</span>
+            </div>
+            <div class="step-actions">
+                <button class="btn btn-primary" id="step2-btn" data-action="runStep2">▶ Add Columns</button>
+            </div>
+            <div class="log" id="step2-log"></div>
+            <div class="result-box" id="step2-result"></div>
+        </div>
+
+        <!-- STEP 3 -->
+        <div class="step" id="step3">
+            <div class="step-header">
+                <div class="step-left">
+                    <div class="step-number">3</div>
+                    <div>
+                        <div class="step-title">Populate Keywords</div>
+                        <div class="step-desc">Auto-fills keyword columns from existing filter_config + category expansions</div>
+                    </div>
+                </div>
+                <span class="step-status" id="step3-status">PENDING</span>
+            </div>
+            <div class="step-actions">
+                <button class="btn btn-primary" id="step3-btn" data-action="runStep3">▶ Populate Keywords</button>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="useExpansions" checked>
+                    Add category expansions (recommended)
+                </label>
+            </div>
+            <div class="log" id="step3-log"></div>
+            <div class="result-box" id="step3-result"></div>
+        </div>
+
+        <!-- STEP 4 -->
+        <div class="step" id="step4">
+            <div class="step-header">
+                <div class="step-left">
+                    <div class="step-number">4</div>
+                    <div>
+                        <div class="step-title">Verify Migration</div>
+                        <div class="step-desc">Confirms all keyword columns are properly populated</div>
+                    </div>
+                </div>
+                <span class="step-status" id="step4-status">PENDING</span>
+            </div>
+            <div class="step-actions">
+                <button class="btn btn-primary" id="step4-btn" data-action="runStep4">▶ Verify</button>
+            </div>
+            <div class="log" id="step4-log"></div>
+            <div class="result-box" id="step4-result"></div>
+        </div>
+
+        <!-- BOTTOM ACTIONS -->
+        <div class="actions-bottom">
+            <button class="btn btn-primary" data-action="runAllSteps">🚀 Run All Steps</button>
+            <button class="btn btn-secondary" data-action="clearLogs">🗑️ Clear Logs</button>
+            <button class="btn btn-secondary" data-action="showRawData">📊 Show Raw Data</button>
+        </div>
+
+        <div class="info-panel">
+            <strong>💡 What this does:</strong><br>
+            • <strong>Step 1:</strong> Tests connection — no changes<br>
+            • <strong>Step 2:</strong> Adds 4 new JSONB columns to filters table (safe, no data lost)<br>
+            • <strong>Step 3:</strong> Reads existing filters, extracts keywords, adds broad category terms<br>
+            • <strong>Step 4:</strong> Shows final state of your filters with keyword counts
+        </div>
+
+        <div class="footer">
+            Developed by <a href="https://leadsync-tau-sand.vercel.app/" target="_blank">Keyn Labs</a> — Migration Dashboard v5.1.1
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
