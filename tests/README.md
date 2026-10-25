@@ -13,7 +13,7 @@ git diff --check
 
 `runtime/harness.js` loads the actual production core, MAIN interceptor, isolated bundle and optionally actual Supabase/background modules in jsdom with mocked Chrome/storage/portal transports. `runtime/worker.test.js` executes the actual `service-worker.js` and its imports in a VM, including listener registration, alarms, restart and shared-storage recovery. Every environment closes windows/timers; no seller session is required or contacted.
 
-The unique aggregate currently reports **113 passing tests** including nested cases (97 top-level, ten runtime suites). `npm run test:compat` repeats selected runtime cases in separate Node processes, checks exit codes/timeouts and reports **18 command results**. Do not add those repeated cases to the unique aggregate count.
+The unique aggregate currently reports **120 passing tests** including nested cases (104 top-level, eleven runtime suites). `npm run test:compat` repeats selected runtime cases in separate Node processes, checks exit codes/timeouts and reports **18 command results**. Do not add those repeated cases to the unique aggregate count.
 
 ## Why the legacy scripts changed
 
@@ -29,7 +29,7 @@ Names below omit the `runtime/` prefix and `.test.js` suffix for runtime suites.
 
 | Legacy command (`node tests/...`) | Actual runtime suites |
 |---|---|
-| `all.test.js` | All ten |
+| `all.test.js` | All eleven |
 | `api_realtime_acquisition.test.js` | bridge, workflow |
 | `bundle.integration.test.js` | workflow, lifecycle, config |
 | `concurrency_overlap_inspection.test.js` | bridge, lifecycle, persistence |
@@ -59,6 +59,30 @@ Names below omit the `runtime/` prefix and `.test.js` suffix for runtime suites.
 - Config **9**: preserve chosen settings/rules/clears, scope, scoring-only saves, revision/null CAS, migration and deletion acknowledgments.
 - Scale **2**: 700 dynamic filters / 100 network inquiries and 20-inquiry dual-route identity behavior.
 - Logging **2**: bounded recoverable persistence and PII/header/credential redaction.
+- Startup **7**: parser/DOM readiness, empty-feed filter notification race using the actual Supabase module, original status-panel reattachment/controls, dependency/configuration failure diagnostics, MAIN acknowledgment, persisted debug-viewer records and explicit idle/missing-bridge reasons.
 - Actual worker **6**: non-destructive install, alarms without popup, restart ownership, restricted transport/modes and truthful scoped refresh.
 
 No mock suite proves real Chrome MV3 scheduling/world isolation, live portal contract/markup, real account eligibility, deployed database constraints/RLS or acquisition speed. The batch timing diagnostic is local jsdom evaluation only. Use [the logged-in validation guide](../docs/LIVE_VALIDATION.md) before claiming live success.
+
+## Supplemental controlled Chromium startup comparison
+
+This optional check uses real Chromium parsing/layout and native `postMessage` between separate CDP MAIN/isolated worlds. It **emulates Chrome storage/runtime** and supplies every HTTP response locally. It does **not** load the extension through Chrome's MV3 loader, test worker suspension, access a logged-in account or confirm a real acquisition/CRM write. CDP startup scheduling approximates (does not certify) manifest scheduling; the original `document_end` comparison runs after parsing at DOMContentLoaded.
+
+Use an installed Chrome/Chromium executable and an isolated test environment. There is no automatic browser download or runtime dependency change:
+
+```bash
+npm install --prefix node_modules/.browser-smoke --no-save --package-lock=false playwright-core@1.56.1
+NODE_PATH="$PWD/node_modules/.browser-smoke/node_modules" \
+  CHROMIUM_EXECUTABLE=/absolute/path/to/chromium \
+  node tests/browser/startup-smoke.cjs
+# Optional: requires the two historical commits in local Git history.
+NODE_PATH="$PWD/node_modules/.browser-smoke/node_modules" \
+  CHROMIUM_EXECUTABLE=/absolute/path/to/chromium \
+  node tests/browser/startup-smoke.cjs --compare \
+  dc5fcbc91c0fc69e83e90c83b86919d4925ba77a \
+  259fb6b849af75e7435d9176ba76bf3c1ee487e3
+```
+
+The comparison asserts the original retains its status panel; the reported regression mounts during parsing, loses that panel and throws on the uninitialized observation map; the fixed tree keeps the original panel, scans and persists diagnostics without that exception. A second fixed-tree case checks network evaluation **before card rendering**, late body replacement with the **same panel node**, and no automatic inactivity-Refresh click. All cases use Monitor and assert zero acquisition claims. These supplemental cases are **not added** to the unique `npm test` count.
+
+See [the startup regression report](../docs/STARTUP_REGRESSION_REPORT.md) for the observed results and outstanding live checks.

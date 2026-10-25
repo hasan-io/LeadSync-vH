@@ -14,7 +14,6 @@ console.log('🔗 https://keynlabs.vercel.app/');
 (function () {
     'use strict';
     var Core = globalThis.LeadSyncCore;
-    if (!Core) throw new Error('LeadSync shared contracts are not loaded');
 
     // ============================================================
     // SCAN LIMIT — maximum DOM lead cards processed per scan cycle.
@@ -4782,6 +4781,9 @@ console.log('🔗 https://keynlabs.vercel.app/');
 
         this.config = Object.assign({}, DEFAULT_CONFIG);
         this._initialized = false;
+        this._observedLeads = new Map(); // Filter notifications can arrive before the first lead.
+        this._startupState = 'LOADING_CONFIG';
+        this._bridgeReady = false;
         this._statsTimer = null;
         this._cleanupTimer = null;
         this._statusPanelTimer = null;
@@ -4797,13 +4799,25 @@ console.log('🔗 https://keynlabs.vercel.app/');
         this._lastKeepAlivePing = 0;
 
         var self = this;
-        this._loadConfig().then(function () { self._init(); });
+        this.logger.logEvent({ level: 'INFO', event: 'app.initialization.started', reasonCode: 'CONTENT_SCRIPT_LOADED', context: { documentState: document.readyState } });
+        this._loadConfig().then(function () { self._init(); }).catch(function (err) { self._failInitialization(err); });
     }
+
+    Orchestrator.prototype._failInitialization = function (err) {
+        this._startupState = 'FAILED';
+        this._initialized = false;
+        this._isPaused = true;
+        if (this.queue) this.queue.pause();
+        if (this.scanner) this.scanner.stopWatching();
+        if (this._bridgeTimer) clearTimeout(this._bridgeTimer);
+        this.logger.logEvent({ level: 'ERROR', event: 'app.initialization.failed', reasonCode: 'STARTUP_ERROR', error: err && err.message || String(err) });
+        _flushLogsNow();
+    };
 
     Orchestrator.prototype._loadConfig = function () {
         var self = this;
-        return new Promise(function (resolve) {
-            chrome.storage.local.get(DEFAULT_CONFIG, function (c) {
+        return new Promise(function (resolve, reject) {
+            chrome.storage.local.get(DEFAULT_CONFIG, function (c) { try {
                 self.config = Object.assign({}, DEFAULT_CONFIG, c);
                 if (c.scoreWeights) self.config.scoreWeights = Object.assign({}, DEFAULT_CONFIG.scoreWeights, c.scoreWeights);
                 if (c.scorePenalties) self.config.scorePenalties = Object.assign({}, DEFAULT_CONFIG.scorePenalties, c.scorePenalties);
@@ -4860,7 +4874,7 @@ console.log('🔗 https://keynlabs.vercel.app/');
                 self.keywordManager.setSupabaseEnabled(self._supabaseEnabled);
 
                 resolve();
-            });
+            } catch (err) { reject(err); } });
         });
     };
     Orchestrator.prototype._init = function () {
@@ -4868,7 +4882,10 @@ console.log('🔗 https://keynlabs.vercel.app/');
         if (this._initializing || this._shutdown) return;
         this._initializing = true;
         if (this.supabase.onFiltersChanged) this._unsubscribeFilters = this.supabase.onFiltersChanged(function (filters) { self._applyFilters(filters); });
-        var domReady = document.body ? Promise.resolve() : new Promise(function (resolve) { document.addEventListener('DOMContentLoaded', resolve, { once: true }); });
+        this._startupState = 'WAITING_FOR_DOM_AND_STATE';
+        // document_start may already have a body that the parser/portal will replace.
+        // Keep network observation early; mount the existing UI only after parsing.
+        var domReady = document.readyState !== 'loading' ? Promise.resolve() : new Promise(function (resolve) { document.addEventListener('DOMContentLoaded', resolve, { once: true }); });
         var restore = Promise.all([this.keywordManager.loadKeywords(), this.circuitBreaker.ready, this.safety.ready, this._acquiredReady]);
         // Start the cache/read while the portal renders. Only validated, age-bounded cache entries are used.
         var filters = restore.then(function () {
@@ -4877,23 +4894,28 @@ console.log('🔗 https://keynlabs.vercel.app/');
                 if (success) self._applyFilters(self.supabase.getFilters());
                 return success;
             });
-        });
+        }).catch(function (err) { self.logger.error('filters.sync.failed', { error: err.message }); return false; });
         Promise.all([domReady, restore]).then(function () {
             if (self._shutdown) return;
             self._injectPanelStyles();
             self.queue.setProcessor(function (lead) { return self._processLead(lead); });
             self._setupUI();
             self._initialized = true;
+            self._startupState = 'READY';
             if (!self.circuitBreaker.canExecute()) self._isPaused = true;
             self._startPeriodicTasks();
             self._updateScannerLifecycleState('initialized');
             // MAIN world drains its document_start buffer only after this point. No startup events are discarded.
+            self._bridgeTimer = setTimeout(function () {
+                if (!self._bridgeReady && !self._shutdown) { self.logger.warn('network.bridge.unavailable', { reasonCode: 'MAIN_WORLD_ACK_MISSING' }); _flushLogsNow(); }
+            }, 2000);
             window.postMessage({ __leadsync_ready__: true }, window.location.origin || '*');
+            self.logger.logEvent({ level: 'INFO', event: 'app.initialization.completed', context: { scannerState: self._scannerState, mode: self.config.mode } });
+            _flushLogsNow();
             self._broadcastStatus();
             filters.then(function (success) { if (!success && self._supabaseEnabled) self._syncSupabaseKeywords(); });
         }).catch(function (err) {
-            self.logger.error('Initialization failed: ' + err.message, { error: err.message });
-            self._isPaused = true;
+            self._failInitialization(err);
         });
     };
 
@@ -4987,6 +5009,11 @@ console.log('🔗 https://keynlabs.vercel.app/');
         }
 
         if (activeFilterCount === 0) {
+            var idleReason = this._supabaseEnabled && !this.supabase._filtersLoaded ? 'FILTERS_LOADING' : 'NO_ELIGIBLE_FILTERS';
+            if (this._scannerState !== SCANNER_STATES.IDLE || this._idleReason !== idleReason) {
+                this._idleReason = idleReason;
+                this.logger.logEvent({ level: 'INFO', event: 'scanner.idle', reasonCode: idleReason, context: { activeFilters: 0 } });
+            }
             var wasRunning = this.scanner && this.scanner._running;
             this._scannerState = SCANNER_STATES.IDLE;
             if (wasRunning) {
@@ -5000,6 +5027,7 @@ console.log('🔗 https://keynlabs.vercel.app/');
             return this._scannerState;
         }
 
+        this._idleReason = null;
         // Active filters exist (> 0) and user has not paused
         if (this._scannerState === SCANNER_STATES.IDLE || this._scannerState === SCANNER_STATES.INITIALIZING || !this.scanner._running) {
             this.logger.info('▶ Eligible filters detected (' + activeFilterCount + '). Transitioning from ' + this._scannerState + ' to SCANNING.');
@@ -5670,6 +5698,10 @@ console.log('🔗 https://keynlabs.vercel.app/');
     Orchestrator.prototype._startStatusUpdates = function () {
         var self = this;
         this._statusPanelTimer = setInterval(function () {
+            // Portal hydration/SPA rendering may replace the body after startup.
+            // Reattach our original node, retaining its controls, position and collapse state.
+            if (self._safetyPanel && !self._safetyPanel.isConnected && document.body) document.body.appendChild(self._safetyPanel);
+            if (document.head && !document.getElementById('bl-panel-styles')) self._injectPanelStyles();
             var s = self.safety.getStatus();
             if (!self._safetyPanel) return;
             var dot = document.getElementById('bl-status-dot');
@@ -5687,6 +5719,8 @@ console.log('🔗 https://keynlabs.vercel.app/');
                 else if (s.cooldown) t += '⏳ Cooldown';
                 else if (self.navigator._running) t += '▶ Loop Running';
                 else if (self.scanner._running) t += '▶ Scanning';
+                else if (self._supabaseEnabled && !self.supabase._filtersLoaded) t += 'Waiting for CRM filters';
+                else if (self._scannerState === SCANNER_STATES.IDLE) t += 'No eligible filters';
                 else t += '⏹ Stopped';
                 text.textContent = t;
             }
@@ -7065,7 +7099,7 @@ try {
             mode: this.config.mode, stats: this.stats,
             queue: this.queue.getStatus(), safety: this.safety.getStatus(),
             scanner: this.scanner.getStatus(), stateStats: this.stateMachine.getStats(),
-            initialized: this._initialized, config: this.config,
+            initialized: this._initialized, startupState: this._startupState, bridgeReady: this._bridgeReady, scannerState: this._scannerState, config: this.config,
             supabaseEnabled: this._supabaseEnabled,
             autoMinimize: this.config.autoMinimize,
             confirmationAnswer: this.config.confirmationAnswer,
@@ -7113,9 +7147,18 @@ try {
         if (this._cleanupTimer) clearInterval(this._cleanupTimer);
         if (this._statusPanelTimer) clearInterval(this._statusPanelTimer);
         if (this._filterWatchTimer) clearInterval(this._filterWatchTimer);
+        if (this._bridgeTimer) clearTimeout(this._bridgeTimer);
         if (this._mandatory30SecTimer) clearInterval(this._mandatory30SecTimer);
         if (this._supabaseEnabled) this.supabase.updateFilterStatus(false);
     };
+
+    // Keep dependency failures in the same persisted diagnostics as later startup
+    // failures instead of throwing before the logger has even been initialized.
+    if (!Core) {
+        new Logger('Startup').logEvent({ level: 'ERROR', event: 'app.initialization.failed', reasonCode: 'SHARED_CORE_MISSING', error: 'LeadSync shared contracts are not loaded; update all extension files and reload the portal tab.' });
+        _flushLogsNow();
+        return;
+    }
 
     if (typeof module !== 'undefined' && module.exports) {
         module.exports.Logger = Logger;
@@ -7182,6 +7225,10 @@ try {
             if (_tornDown || !evt || evt.source !== window || !evt.data || (evt.origin && evt.origin !== window.location.origin)) return;
             var data = evt.data;
             if (data.__leadsync_log__) { orchestrator.logger.logEvent(data); return; }
+            if (data.__leadsync_bridge_ready__) {
+                if (!orchestrator._bridgeReady) orchestrator.logger.info('network.bridge.ready', { reasonCode: 'MAIN_WORLD_ACK' });
+                orchestrator._bridgeReady = true; clearTimeout(orchestrator._bridgeTimer); return;
+            }
             if (data.__leadsync_lead_acquired__) { orchestrator.actionAdapter.handleNetworkResult(data); return; }
             if (data.__leadsync_passive_lead__ || data.__leadsync_network__ || data.type === '__leadsync_passive_lead__') {
                 var at = Number(data.ts || data.timestamp) || Date.now();

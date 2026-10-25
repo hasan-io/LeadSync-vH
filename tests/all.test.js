@@ -11,3 +11,4 @@ require('./runtime/config.test.js');
 require('./runtime/logging.test.js');
 require('./runtime/scale.test.js');
 require('./runtime/worker.test.js');
+require('./runtime/startup.test.js');

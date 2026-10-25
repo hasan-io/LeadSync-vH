@@ -14,6 +14,30 @@ This implementation is ready for controlled user testing, **not live-certified**
    - `https://app.indiamart.com/buyleads`
 7. Check `chrome://extensions` → extension Errors and Inspect views → service worker, the page panel and the diagnostics page. Check that initialization completes and filters are fresh. A fresh empty filter set should idle acquisition, not reuse old keywords.
 
+### Startup/panel/logging regression retest
+
+- Update **all** repository files, not only `src/bundle.js`; `src/lead-core.js` is required in both worlds. Reload the existing extension and then open/reload one seller-feed tab yourself. Reloading an extension does not refresh an already-open tab's invalidated content-script context. Do not load a second copy or clear retained claims/outbox/settings.
+- In Monitor, leave the toolbar popup closed. The original bottom **BuyLead** status panel (`#bl-safety-status`) should remain present, with its Scanned/Acquired/Matched counters, CRM indicator, Stop Sold control, Pause/Resume and Filters. It is not the Assisted approval card. Also open the existing toolbar popup and confirm it can retrieve the current tab's status/settings.
+- Open diagnostics, remove any viewer search/level/category filters **without clearing stored logs**, and look for `app.initialization.started`, `app.initialization.completed`, `network.bridge.ready`, `scanner.started` and subsequent scan/filter events. A fresh empty/ineligible filter set should instead report `scanner.idle` / `NO_ELIGIBLE_FILTERS`, not pretend to scan or buy.
+- Failures should be visible as `app.initialization.failed` (including `SHARED_CORE_MISSING`) or `network.bridge.unavailable` / `MAIN_WORLD_ACK_MISSING`. Check the extension Errors view too: a failed manifest/script load can occur before any logger executes. A missing bridge acknowledgment is a diagnostic, not an acquisition result or authorization.
+- Read-only status, if needed, from **service-worker DevTools**, with exactly one supported feed tab open:
+
+  ```js
+  const [feedTab] = await chrome.tabs.query({ url: [
+    'https://seller.indiamart.com/bltxn/*',
+    'https://app.indiamart.com/buyleads*'
+  ] });
+  if (feedTab) {
+    const { success, initialized, startupState, bridgeReady, scannerState } =
+      await chrome.tabs.sendMessage(feedTab.id, { action: 'GET_STATUS' });
+    console.log({ success, initialized, startupState, bridgeReady, scannerState });
+  }
+  ```
+
+  Expected healthy initialization is `startupState: 'READY'`, `initialized: true`, `bridgeReady: true`. Scanner state depends on real filters and saved pause/safety restrictions. `READY` certifies only local initialization, **not** portal eligibility, acquisition or CRM acknowledgment. A no-receiver error means the tab has no responding content-script handler; reload/check its route and extension Errors rather than assuming filters are at fault.
+- The official **“You are inactive, get freshly leads” / Refresh** message is separate. The old version simulated mouse activity and auto-dismissed/refreshed prompts; those paths stay disabled. Complete any normal portal interaction manually. Do not simulate activity, force-refresh or bypass a gate. Record whether initialization/scanning events were present before the message appeared.
+- If logs are still completely absent after a clean tab load, stop acquisition and return the sanitized startup status, route, extension Errors text and a screenshot with viewer filters visible. The fully empty live log view has **not** been reproduced locally; do not treat the controlled renderer tests as proof it is resolved.
+
 If the portal requires login/OTP, purchase, balance, subscription or eligibility action, complete it manually or stop. Do not bypass a gate or remove the portal overlay to force the extension to continue.
 
 ## 2. Verify the database/CRM contract before buying
