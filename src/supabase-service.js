@@ -1,7 +1,9 @@
+(function (root) {
+'use strict';
 // src/supabase-service.js
 // Complete Supabase integration with data management
 // Developed by Keyn Labs
-// Version 4.9.0
+// Version 5.1.0
 // ============================================================================
 // CHANGELOG v4.9.0
 //   • insertLead returns { data, conflict, existingId } on 409 (no throw)
@@ -25,7 +27,10 @@ const TIMEOUT_WRITE  = 15000;
 const TIMEOUT_HEALTH = 5000;
 
 class SupabaseService {
-    constructor() {
+    constructor(options) {
+        options = options || {};
+        this._useProxy = options.useProxy !== false;
+        this._filterListeners = [];
         this.url = SUPABASE_URL;
         this.key = SUPABASE_KEY;
         this.headers = {
@@ -38,11 +43,13 @@ class SupabaseService {
         this._filters = [];
         this._filtersLoaded = false;
         this._filtersLastFetch = 0;
-        this._filtersTTL = 30000; // 30s in-memory cache TTL (reduces redundant polling micro-jank) // 30s in-memory cache TTL
+        this._filtersRequestStartedAt = 0;
+        this._filtersTTL = 10000; // Bound filter staleness; matching never waits on a read.
         this._filtersCacheKey = 'cached_filters_v1';
         this._filtersCacheTTL = 60000; // 60s storage cache TTL
         this._inFlightFetchPromise = null;
-        this._clientId = 'default';
+        this._clientId = null;
+        this._scopeVersion = 0;
         this._statsBuffer = { scanned: 0, matched: 0, clicked: 0 };
         this._statsFlushTimer = null;
         this._statsPending = false;
@@ -102,7 +109,7 @@ class SupabaseService {
         timeoutMs = timeoutMs || TIMEOUT_READ;
 
         // Try service worker proxy first (bypasses webpage CSP/CORS on IndiaMART)
-        if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+        if (this._useProxy && typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
             try {
                 var swResponse = await new Promise(function(resolve, reject) {
                     var timer = setTimeout(function() {
@@ -152,7 +159,9 @@ class SupabaseService {
                     }
                 };
             } catch (swErr) {
-                // If service worker message fails or times out, seamlessly fall back to direct fetch without alarming warnings
+                // A timed-out mutation may already have committed. Never replay it through a second transport.
+                if (options && !/^(GET|HEAD)$/i.test(options.method || 'GET')) throw swErr;
+                // Read-only fallback is safe when the worker is temporarily unavailable.
                 if (this.logger && typeof this.logger.debug === 'function') {
                     this.logger.debug('Service worker proxy unavailable (' + swErr.message + '), falling back to direct fetch');
                 }
@@ -165,8 +174,9 @@ class SupabaseService {
         try {
             var opts = Object.assign({}, options || {}, { signal: controller.signal });
             var res = await fetch(url, opts);
+            var text = await res.text();
             clearTimeout(timer);
-            return res;
+            return { ok: res.ok, status: res.status, statusText: res.statusText, headers: res.headers, text: async function () { return text; }, json: async function () { return text ? JSON.parse(text) : null; } };
         } catch (err) {
             clearTimeout(timer);
             if (err.name === 'AbortError') {
@@ -187,6 +197,7 @@ class SupabaseService {
     async loadFilters(forceRefresh) {
         var self = this;
         var now = Date.now();
+        var scopeVersion = this._scopeVersion;
 
         // 1) In-flight coalescing — return existing shared promise if a network fetch is ongoing
         if (this._inFlightFetchPromise) {
@@ -205,6 +216,7 @@ class SupabaseService {
         // 3) Storage cache — instant cold boot only (if within cache TTL)
         if (!forceRefresh && !this._filtersLoaded) {
             var cached = await this._readFiltersCache();
+            if (scopeVersion !== this._scopeVersion) return false;
             if (cached && Array.isArray(cached.filters)) {
                 var cacheAge = now - cached.timestamp;
                 if (cacheAge <= this._filtersCacheTTL) {
@@ -212,6 +224,7 @@ class SupabaseService {
                     this._filters = cached.filters;
                     this._filtersLoaded = true;
                     this._filtersLastFetch = cached.timestamp;
+                    this._filtersRequestStartedAt = cached.requestStartedAt || cached.timestamp;
                     var cacheDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tCache0;
                     this._log('info', 'filters.cache.hit', {
                         reasonCode: 'STORAGE_CACHE_VALID',
@@ -221,9 +234,7 @@ class SupabaseService {
                             ageSec: Math.round(cacheAge / 1000)
                         }
                     });
-                    if (this._filters.length > 0 && this._filters[0].client_id) {
-                        this._clientId = this._filters[0].client_id;
-                    }
+
                     this._refreshFiltersInBackground();
                     return true;
                 }
@@ -234,16 +245,22 @@ class SupabaseService {
             reasonCode: forceRefresh ? 'FORCE_REFRESH' : 'CACHE_EXPIRED'
         });
 
+        // A concurrent cold-boot caller may have started a request while storage was being read.
+        if (this._inFlightFetchPromise) return this._inFlightFetchPromise;
         // 4) Network fetch (coalesced)
-        this._inFlightFetchPromise = this._fetchFiltersFromNetwork().finally(function () {
-            self._inFlightFetchPromise = null;
+        var pending = this._fetchFiltersFromNetwork().finally(function () {
+            if (self._inFlightFetchPromise === pending) self._inFlightFetchPromise = null;
         });
-        return this._inFlightFetchPromise;
+        this._inFlightFetchPromise = pending;
+        return pending;
     }
 
     async _fetchFiltersFromNetwork() {
         var syncOpId = 'op_sync_' + Date.now().toString(36);
         var tSync0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        var scopeVersion = this._scopeVersion;
+        var clientId = this._clientId;
+        var requestStartedAt = Date.now();
         this._log('info', 'filters.sync.started', { operationId: syncOpId });
 
         var maxRetries = 2;
@@ -251,25 +268,28 @@ class SupabaseService {
         var lastErr = null;
         while (attempt < maxRetries) {
             try {
-                var url = this.url + '/rest/v1/filters?is_active=eq.true&select=*&order=id.asc';
+                var url = this.url + '/rest/v1/filters?is_active=eq.true&select=*&order=id.asc' + (clientId ? '&client_id=eq.' + encodeURIComponent(clientId) : '');
                 var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
                 if (!response.ok) throw new Error('HTTP ' + response.status);
 
                 var data = await response.json();
-                this._filters = Array.isArray(data) ? data : [];
+                if (scopeVersion !== this._scopeVersion || requestStartedAt < this._filtersRequestStartedAt) return false;
+                if (!Array.isArray(data)) throw new Error('Invalid filters response: expected an array');
+                this._filters = data;
                 this._filtersLoaded = true;
                 this._filtersLastFetch = Date.now();
+                this._filtersRequestStartedAt = requestStartedAt;
 
-                if (this._filters.length > 0 && this._filters[0].client_id) {
-                    this._clientId = this._filters[0].client_id;
-                }
+
 
                 // Write to storage cache only if semantic filter content changed (excluding updated_at / poll timestamps)
                 var newSig = this._buildSemanticSignature(this._filters);
                 var configChanged = this._lastWrittenFiltersSig !== newSig;
+                var cacheWritten = await this._writeFiltersCache(this._filters);
+                if (cacheWritten === false) return false;
+                if (scopeVersion !== this._scopeVersion) return false;
                 if (configChanged) {
                     this._lastWrittenFiltersSig = newSig;
-                    await this._writeFiltersCache(this._filters);
                     this._log('info', 'filters.config.changed', {
                         operationId: syncOpId,
                         reasonCode: 'CONFIG_CHANGED',
@@ -283,6 +303,7 @@ class SupabaseService {
                     });
                 }
 
+                this._notifyFilters();
                 var syncDuration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - tSync0;
                 this._log('info', 'filters.sync.completed', {
                     operationId: syncOpId,
@@ -311,29 +332,37 @@ class SupabaseService {
     }
 
     _buildSemanticSignature(filters) {
-        return JSON.stringify((filters || []).map(function (f) {
-            return {
-                id: f.id,
-                name: f.name || f.filter_name || '',
-                kw: (f.product_keywords || []).slice().sort(),
-                neg: (f.negative_keywords || []).slice().sort(),
-                loc: (f.sender_locations || []).slice().sort(),
-                act: f.is_active,
-                mode: f.match_mode || 'any',
-                del: f.is_deleted || f.deleted_at ? true : false
-            };
-        }));
+        return (root.LeadSyncCore || (typeof require === 'function' && require('./lead-core.js'))).signature(filters);
     }
 
+    _clientQuery() { return this._clientId ? '&client_id=eq.' + encodeURIComponent(this._clientId) : ''; }
     setClientId(clientId) {
-        this._clientId = clientId || 'default';
+        var next = clientId && clientId !== 'default' ? String(clientId) : null;
+        if (next === this._clientId) return;
+        this._clientId = next;
+        this._scopeVersion++;
+        // Old requests may finish, but their generation is ignored and cannot overwrite this scope.
+        this._inFlightFetchPromise = null;
+        this._filters = [];
+        this._filtersLoaded = false;
+        this._filtersLastFetch = 0;
+        this._filtersRequestStartedAt = 0;
     }
-
-    _refreshFiltersInBackground() {
+    onFiltersChanged(fn) {
+        this._filterListeners.push(fn);
         var self = this;
-        this._log('info', '🔄 Refreshing filters in background...');
-        // Fire and forget — do not await
-        this._fetchFiltersFromNetwork().catch(function() {});
+        return function () { self._filterListeners = self._filterListeners.filter(function (f) { return f !== fn; }); };
+    }
+    _notifyFilters() {
+        var self = this;
+        this._filterListeners.forEach(function (fn) { try { fn(self._filters); } catch (e) { self._log('warn', 'Filter listener failed', { error: e.message }); } });
+    }
+    _refreshFiltersInBackground() {
+        if (this._inFlightFetchPromise) return this._inFlightFetchPromise;
+        var self = this;
+        var pending = this._fetchFiltersFromNetwork().finally(function () { if (self._inFlightFetchPromise === pending) self._inFlightFetchPromise = null; });
+        this._inFlightFetchPromise = pending;
+        return pending;
     }
 
     _readFiltersCache() {
@@ -342,7 +371,7 @@ class SupabaseService {
             try {
                 chrome.storage.local.get(self._filtersCacheKey, function(result) {
                     var cached = result && result[self._filtersCacheKey];
-                    if (cached && typeof cached.timestamp === 'number') {
+                    if (cached && typeof cached.timestamp === 'number' && (cached.clientId || null) === self._clientId && Date.now() >= cached.timestamp && Date.now() - cached.timestamp < self._filtersCacheTTL) {
                         resolve(cached);
                     } else {
                         resolve(null);
@@ -355,20 +384,30 @@ class SupabaseService {
     }
 
     _writeFiltersCache(filters) {
-        var self = this;
+        var self = this, clientId = this._clientId, requestStartedAt = this._filtersRequestStartedAt;
         return new Promise(function(resolve) {
             try {
-                var payload = {};
-                payload[self._filtersCacheKey] = {
-                    filters: filters,
-                    timestamp: Date.now()
-                };
-                chrome.storage.local.set(payload, function() { resolve(); });
-            } catch (e) {
-                resolve();
-            }
+                chrome.storage.local.get(self._filtersCacheKey, function(result) {
+                    var existing = result && result[self._filtersCacheKey];
+                    if (clientId !== self._clientId) { resolve(false); return; }
+                    if (existing && Array.isArray(existing.filters) && (existing.clientId || null) === clientId && (existing.requestStartedAt || existing.timestamp) > requestStartedAt && existing.timestamp <= Date.now()) {
+                        self._filters = existing.filters;
+                        self._filtersLoaded = true;
+                        self._filtersLastFetch = existing.timestamp;
+                        self._filtersRequestStartedAt = existing.requestStartedAt || existing.timestamp;
+                        self._notifyFilters();
+                        resolve(false);
+                        return;
+                    }
+                    var payload = {};
+                    payload[self._filtersCacheKey] = { filters: filters, timestamp: self._filtersLastFetch, requestStartedAt: requestStartedAt, clientId: clientId };
+                    chrome.storage.local.set(payload, function() { resolve(true); });
+                });
+            } catch (e) { resolve(true); } // In-memory matching remains usable when storage is unavailable.
         });
     }
+
+    hasFreshFilters() { return this._filtersLoaded && Date.now() >= this._filtersLastFetch && Date.now() - this._filtersLastFetch <= this._filtersCacheTTL; }
 
     /** @returns {Array} Currently cached filters */
     getFilters() {
@@ -381,12 +420,26 @@ class SupabaseService {
      * @returns {Promise<Object|null>}
      */
     async getFilterById(id) {
+        var scopeVersion = this._scopeVersion, requestStartedAt = Date.now();
         try {
-            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(id) + '&select=*&limit=1';
+            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(id) + '&select=*&limit=1' + this._clientQuery();
             var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
             if (!response.ok) throw new Error('HTTP ' + response.status);
             var arr = await response.json();
-            return Array.isArray(arr) && arr.length > 0 ? arr[0] : null;
+            if (scopeVersion !== this._scopeVersion || !Array.isArray(arr)) return null;
+            var row = arr.length ? arr[0] : null;
+            // A later exact reconciliation supersedes an older in-flight list response.
+            // Do not renew the whole list's age from a read of only one filter.
+            if (requestStartedAt >= this._filtersRequestStartedAt) {
+                this._filtersRequestStartedAt = requestStartedAt;
+                if (this._filtersLoaded) {
+                    this._filters = this._filters.filter(function (f) { return String(f.id) !== String(id); });
+                    if (row && row.is_active !== false && !row.deleted_at && !row.is_deleted) this._filters.push(row);
+                    await this._writeFiltersCache(this._filters);
+                    if (scopeVersion === this._scopeVersion) this._notifyFilters();
+                }
+            }
+            return row;
         } catch (err) {
             this._log('warn', 'getFilterById failed', { id: id, error: err.message });
             return null;
@@ -399,7 +452,7 @@ class SupabaseService {
      */
     async getActiveFilterCount() {
         try {
-            var url = this.url + '/rest/v1/filters?is_active=eq.true&select=id';
+            var url = this.url + '/rest/v1/filters?is_active=eq.true&select=id' + this._clientQuery();
             var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
             if (!response.ok) throw new Error('HTTP ' + response.status);
             var arr = await response.json();
@@ -437,7 +490,7 @@ class SupabaseService {
                 self._filterStatusDebounceTimer = null;
                 self._doFilterStatusPush(self._filterStatusPending);
             }, 5000 - (now - this._filterStatusLastPushed));
-            return true;
+            return false; // queued, not yet acknowledged
         }
 
         return this._doFilterStatusPush(isRunning);
@@ -445,7 +498,7 @@ class SupabaseService {
 
     async _doFilterStatusPush(isRunning) {
         try {
-            var url = this.url + '/rest/v1/filters?is_active=eq.true';
+            var url = this.url + '/rest/v1/filters?is_active=eq.true' + this._clientQuery();
             var body = {
                 is_running: isRunning,
                 last_poll_time: new Date().toISOString()
@@ -468,84 +521,53 @@ class SupabaseService {
         }
     }
 
-    /**
-     * Deactivates a filter when its unique sellers quota (10 leads) is fulfilled.
-     * @param {string|number} filterId
-     * @returns {Promise<boolean>}
-     */
+    /** Temporarily disable only the observed active revision; return its persisted revision. */
     async deactivateFilter(filterId) {
         if (!filterId) return false;
         try {
-            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(filterId);
-            var body = {
-                is_active: false,
-                is_running: false,
-                updated_at: new Date().toISOString()
-            };
-            var response = await this._fetchWithTimeout(url, {
-                method: 'PATCH',
-                headers: this.headers,
-                body: JSON.stringify(body)
-            }, TIMEOUT_WRITE);
-
+            var current = this._filters.find(function (f) { return String(f.id) === String(filterId); });
+            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(filterId) + '&is_active=eq.true' + this._clientQuery();
+            if (current && current.updated_at) url += '&updated_at=eq.' + encodeURIComponent(current.updated_at);
+            var body = { is_active: false, is_running: false, updated_at: new Date().toISOString() };
+            var response = await this._fetchWithTimeout(url, { method: 'PATCH', headers: this.headers, body: JSON.stringify(body) }, TIMEOUT_WRITE);
             if (!response.ok) throw new Error('HTTP ' + response.status);
-
-            // Also update in-memory cache if present
-            if (Array.isArray(this._filters)) {
-                for (var i = 0; i < this._filters.length; i++) {
-                    if (String(this._filters[i].id) === String(filterId)) {
-                        this._filters[i].is_active = false;
-                        this._filters[i].is_running = false;
-                        break;
-                    }
-                }
-            }
-
-            this._log('info', 'Filter auto-deactivated after quota reached (10 leads)', { filterId: filterId });
-            return true;
+            var rows = await response.json();
+            if (!Array.isArray(rows) || !rows[0] || !rows[0].updated_at) return false;
+            if (current) Object.assign(current, rows[0]);
+            return { success: true, updatedAt: rows[0].updated_at };
         } catch (err) {
-            this._log('warn', 'Failed to deactivate filter in Supabase', { filterId: filterId, error: err.message });
+            this._log('warn', 'Filter auto-deactivation not acknowledged', { filterId: filterId, error: err.message });
             return false;
         }
     }
 
-    /**
-     * Reactivates a filter (e.g. after 60s temporary deactivation or manual toggle).
-     * @param {string|number} filterId
-     * @returns {Promise<boolean>}
-     */
-    async reactivateFilter(filterId) {
+    /** Never re-enable a deleted, edited, or manually disabled CRM revision. */
+    async reactivateFilter(filterId, deactivationVersion) {
         if (!filterId) return false;
         try {
-            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(filterId);
-            var body = {
-                is_active: true,
-                is_running: true,
-                updated_at: new Date().toISOString()
-            };
-            var response = await this._fetchWithTimeout(url, {
-                method: 'PATCH',
-                headers: this.headers,
-                body: JSON.stringify(body)
-            }, TIMEOUT_WRITE);
-
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-
-            // Also update in-memory cache if present
-            if (Array.isArray(this._filters)) {
-                for (var i = 0; i < this._filters.length; i++) {
-                    if (String(this._filters[i].id) === String(filterId)) {
-                        this._filters[i].is_active = true;
-                        this._filters[i].is_running = true;
-                        break;
-                    }
-                }
+            // No recorded acknowledgement (including an old-extension migration): only accept
+            // an already-active current row. Never guess that an inactive row was our own change.
+            if (!deactivationVersion) {
+                var current = await this.getFilterById(filterId);
+                return !!current && current.is_active === true && !current.deleted_at && !current.is_deleted;
             }
-
-            this._log('info', 'Filter reactivated in Supabase', { filterId: filterId });
+            var url = this.url + '/rest/v1/filters?id=eq.' + encodeURIComponent(filterId) + '&is_active=eq.false&updated_at=eq.' + encodeURIComponent(deactivationVersion) + this._clientQuery();
+            var response = await this._fetchWithTimeout(url, {
+                method: 'PATCH', headers: this.headers,
+                body: JSON.stringify({ is_active: true, is_running: true, updated_at: new Date().toISOString() })
+            }, TIMEOUT_WRITE);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            var rows = await response.json();
+            if (!Array.isArray(rows) || !rows.length) {
+                // A newer active row is a manual re-enable; a newer inactive/deleted row is not.
+                var latest = await this.getFilterById(filterId);
+                return !!latest && latest.is_active === true && !latest.deleted_at && !latest.is_deleted;
+            }
+            var cached = this._filters.find(function (f) { return String(f.id) === String(filterId); });
+            if (cached) Object.assign(cached, rows[0]);
             return true;
         } catch (err) {
-            this._log('warn', 'Failed to reactivate filter in Supabase', { filterId: filterId, error: err.message });
+            this._log('warn', 'Filter remains disabled pending CRM refresh', { filterId: filterId, error: err.message });
             return false;
         }
     }
@@ -557,16 +579,18 @@ class SupabaseService {
      * @param {string} uniqueQueryId
      * @returns {Promise<Object|null>}
      */
-    async leadExists(uniqueQueryId) {
+    async leadExists(uniqueQueryId, throwOnError) {
         try {
             var url = this.url + '/rest/v1/leads?unique_query_id=eq.' +
                 encodeURIComponent(uniqueQueryId) +
-                '&select=id,status,is_contacted&limit=1';
+                '&select=id,status,is_contacted,is_matched&limit=1';
             var response = await this._fetchWithTimeout(url, { headers: this.headers }, TIMEOUT_READ);
             if (!response.ok) throw new Error('HTTP ' + response.status);
             var data = await response.json();
+            if (!Array.isArray(data)) throw new Error('Invalid lead lookup representation');
             return data.length > 0 ? data[0] : null;
         } catch (err) {
+            if (throwOnError) throw err;
             this._log('warn', 'Failed to check lead existence', { error: err.message, uniqueQueryId: uniqueQueryId });
             return null;
         }
@@ -584,7 +608,7 @@ class SupabaseService {
         var body = {
             unique_query_id: lead.uniqueQueryId,
             query_type: lead.queryType || 'BUY_LEAD',
-            query_time: lead.queryTime || new Date().toISOString(),
+            query_time: lead.queryTime && !isNaN(Date.parse(lead.queryTime)) ? new Date(lead.queryTime).toISOString() : new Date().toISOString(),
             sender_name: lead.senderName || null,
             sender_mobile: lead.senderMobile || null,
             sender_mobile_alt: lead.senderMobileAlt || null,
@@ -631,6 +655,7 @@ class SupabaseService {
                 // Conflict — fetch existing row so caller can recover id
                 this._log('debug', '🔁 Lead already exists (409)', { uniqueQueryId: lead.uniqueQueryId });
                 var existing = await this.leadExists(lead.uniqueQueryId);
+                if (!existing || !existing.id) throw new Error('Conflict row could not be recovered');
                 this._log('info', 'crm.write.completed', {
                     operationId: crmOpId,
                     traceId: lead.traceId || null,
@@ -652,7 +677,8 @@ class SupabaseService {
             }
 
             var data = await response.json();
-            var row = data[0] || null;
+            var row = Array.isArray(data) ? data[0] : null;
+            if (!row || !row.id) throw new Error('Lead insert returned no persisted row');
             this._log('info', 'crm.write.completed', {
                 operationId: crmOpId,
                 traceId: lead.traceId || null,
@@ -678,41 +704,46 @@ class SupabaseService {
     // ============================================================
     // LEADS - Update
     // ============================================================
-    async updateLead(idOrUniqueQueryId, updates) {
+    async updateLead(identifier, updates) {
         try {
-            var url = this.url + '/rest/v1/leads?';
-            if (typeof idOrUniqueQueryId === 'number' || (typeof idOrUniqueQueryId === 'string' && /^\d+$/.test(idOrUniqueQueryId))) {
-                url += 'id=eq.' + idOrUniqueQueryId;
-            } else {
-                url += 'unique_query_id=eq.' + encodeURIComponent(idOrUniqueQueryId);
-            }
-            var body = Object.assign({}, updates, { updated_at: new Date().toISOString() });
-
+            // Number = DB row PK; string = IndiaMART inquiry ID. Prefer explicit objects.
+            var byRow = identifier && typeof identifier === 'object' && identifier.id != null;
+            var rowId = byRow ? identifier.id : (typeof identifier === 'number' ? identifier : null);
+            var queryId = identifier && typeof identifier === 'object' ? identifier.uniqueQueryId : identifier;
+            if (rowId == null && !queryId) throw new Error('Missing lead identifier');
+            var url = this.url + '/rest/v1/leads?' + (rowId != null ? 'id=eq.' + encodeURIComponent(rowId) : 'unique_query_id=eq.' + encodeURIComponent(queryId));
+            // Confirmed success is monotonic, including concurrent/out-of-order PATCHes.
+            var downgrade = updates.is_contacted !== true;
+            if (downgrade) url += '&is_contacted=not.is.true&or=(status.is.null,status.neq.contacted)';
             var response = await this._fetchWithTimeout(url, {
-                method: 'PATCH',
-                headers: this.headers,
-                body: JSON.stringify(body)
+                method: 'PATCH', headers: this.headers,
+                body: JSON.stringify(Object.assign({}, updates, { updated_at: new Date().toISOString() }))
             }, TIMEOUT_WRITE);
-
             if (!response.ok) throw new Error('HTTP ' + response.status);
-
-            this._log('debug', '✏️ Lead updated', { identifier: idOrUniqueQueryId, updates: updates });
+            var rows = await response.json();
+            if (!Array.isArray(rows) || !rows.length) {
+                // An empty representation is not a successful write (RLS and no-row matches included).
+                return false;
+            }
             return true;
         } catch (err) {
-            this._log('error', '❌ Failed to update lead', { error: err.message, identifier: idOrUniqueQueryId });
+            this._log('error', 'crm.write.failed', { error: err.message });
             return false;
         }
     }
 
-    async markLeadMatched(idOrUniqueQueryId) {
-        return this.updateLead(idOrUniqueQueryId, { is_matched: true, status: 'matched' });
-    }
+    async markLeadMatched(identifier) { return this.updateLead(identifier, { is_matched: true, status: 'matched' }); }
+    async markLeadContacted(identifier) { return this.updateLead(identifier, { is_contacted: true, is_matched: true, status: 'contacted' }); }
 
-    async markLeadContacted(idOrUniqueQueryId) {
-        return this.updateLead(idOrUniqueQueryId, {
-            is_contacted: true,
-            status: 'contacted',
-            updated_at: new Date().toISOString()
+    async syncLead(lead, outcome) {
+        // Durable write acceptance != database success. The MV3 worker owns retries after tab closure.
+        return new Promise(function (resolve) {
+            try {
+                chrome.runtime.sendMessage({ action: 'CRM_SYNC_LEAD', lead: lead, outcome: outcome || null }, function (response) {
+                    var err = chrome.runtime.lastError;
+                    resolve(err ? { queued: false, error: err.message } : (response || { queued: false, error: 'No worker acknowledgement' }));
+                });
+            } catch (e) { resolve({ queued: false, error: e.message }); }
         });
     }
 
@@ -740,6 +771,8 @@ class SupabaseService {
             }, TIMEOUT_WRITE);
 
             if (!response.ok) throw new Error('HTTP ' + response.status);
+            var rows = await response.json();
+            if (!Array.isArray(rows) || !rows[0] || rows[0].id == null) throw new Error('History write returned no persisted row');
 
             this._log('debug', '📝 History added', { leadId: leadId, action: action });
             return true;
@@ -774,17 +807,16 @@ class SupabaseService {
         // Skip if no filters cached — PATCH would match zero rows
         if (!this._filters || this._filters.length === 0) {
             this._statsPending = false;
-            return;
+            return false;
         }
 
         this._statsPending = true;
         try {
-            var url = this.url + '/rest/v1/filters?is_active=eq.true';
+            var url = this.url + '/rest/v1/filters?is_active=eq.true' + this._clientQuery();
             var body = {
                 stats_scanned: this._statsBuffer.scanned,
                 stats_matched: this._statsBuffer.matched,
-                stats_clicked: this._statsBuffer.clicked,
-                updated_at: new Date().toISOString()
+                stats_clicked: this._statsBuffer.clicked
             };
 
             var response = await this._fetchWithTimeout(url, {
@@ -794,16 +826,21 @@ class SupabaseService {
             }, TIMEOUT_WRITE);
 
             if (response.ok) {
+                var rows = await response.json();
+                if (!Array.isArray(rows) || !rows.length) return false;
                 this._log('debug', '📊 Stats flushed to DB', this._statsBuffer);
+                return true;
             }
             if (!response.ok) {
                 var errBody = '';
                 try { errBody = await response.text(); } catch (e) { }
                 this._log('debug', 'Stats flush non-OK response: HTTP ' + response.status + ' ' + errBody);
             }
+            return false;
         } catch (err) {
             var errMsg = (err && err.message) ? err.message : String(err);
             this._log('warn', 'Stats flush failed: ' + errMsg, { error: errMsg });
+            return false;
         } finally {
             this._statsPending = false;
         }
@@ -893,7 +930,7 @@ class SupabaseService {
 
     async resetFilterStats() {
         try {
-            var url = this.url + '/rest/v1/filters?is_active=eq.true';
+            var url = this.url + '/rest/v1/filters?is_active=eq.true' + this._clientQuery();
             var body = {
                 stats_scanned: 0,
                 stats_matched: 0,
@@ -1033,5 +1070,6 @@ class SupabaseService {
 }
 
 // Export to window for content-script consumption and module for Node testing
-if (typeof window !== 'undefined') window.SupabaseService = SupabaseService;
+root.SupabaseService = SupabaseService;
 if (typeof module !== 'undefined' && module.exports) module.exports = SupabaseService;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

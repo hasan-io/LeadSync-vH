@@ -1,14 +1,14 @@
 // popup/popup.js
 // Popup controller with strict country toggle + live queue + honest UI
 // Developed by Keyn Labs
-// Version 5.3.0
+// Version 5.1.0
 // ============================================================================
 // CHANGELOG v5.3.0
 //   • CRM button — opens CRM in new tab
 //   • Fixed misplaced CRM button code
 // ============================================================================
 
-console.log('BuyLead Assistant Popup v5.3.0');
+console.log('BuyLead Assistant Popup v5.1.0');
 
 var browserAPI = (typeof browser !== 'undefined') ? browser : chrome;
 
@@ -72,7 +72,7 @@ function initializeDefaultMode() {
 function loadAllSettings() {
     browserAPI.storage.local.get([
         'mode',
-        'supabaseEnabled', 'confirmationAnswer', 'autoMinimize',
+        'supabaseEnabled', 'confirmationAnswer', 'autoMinimize', 'purchaseAction',
         'strictCountryMode', 'allowedCountries', 'strictCountryRejectUnknown',
         'maxPerMinute', 'cooldownMs'
     ], function(result) {

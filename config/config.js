@@ -1,7 +1,7 @@
 // config/config.js
 // Full CRUD for filters + keywords management
 // Developed by Keyn Labs
-// Version 7.1.0
+// Version 5.1.0
 // ============================================================================
 // CHANGELOG v7.1.0
 //   • Attio-style UI — removed emojis from all user-facing strings
@@ -9,7 +9,7 @@
 //   • All functionality preserved
 // ============================================================================
 
-console.log('BuyLead Assistant Config v7.1.0');
+console.log('BuyLead Assistant Config v5.1.0');
 
 var browserAPI = (typeof browser !== 'undefined') ? browser : chrome;
 var SUPABASE_URL = 'https://zvhuromubukylsxrsfiz.supabase.co';
@@ -25,11 +25,13 @@ var SB_HEADERS = {
 var SB_FETCH_TIMEOUT = 12000;
 
 // ============================================================
-// DEFAULT CONFIG — MIRRORS bundle.js v6.2 / service-worker v4.2
+// DEFAULT CONFIG — 5.1.0 (missing values only)
 // ============================================================
 var DEFAULT_CONFIG = {
     mode: 'AUTOMATIC',
     minScore: 60,
+    supabaseClientId: '',
+    proactiveFeedPolling: false,
 
     maxPerMinute: 60,
     maxPerHour: 400,
@@ -59,12 +61,12 @@ var DEFAULT_CONFIG = {
     loopIntervalMs: 250,
     loadMoreWaitMs: 900,
     maxStuckLoops: 3,
-    maxReloadsPerSession: 999999,
-    autoReloadOnComplete: true,
-    autoReloadDelayMs: 100,
+    maxReloadsPerSession: 0,
+    autoReloadOnComplete: false,
+    autoReloadDelayMs: 2500,
 
     autoMinimize: true,
-    popupTimeoutMs: 5000,
+    popupTimeoutMs: 15000,
     confirmationAnswer: 'yes',
     purchaseAction: 'close',
 
@@ -75,6 +77,7 @@ var DEFAULT_CONFIG = {
 
 var supabaseEnabled = true;
 var editingFilterId = null;
+var editingFilterSnapshot = null;
 
 // ============================================================
 // FETCH HELPER WITH TIMEOUT
@@ -85,7 +88,17 @@ async function sbFetch(url, options, timeoutMs) {
     var timer = setTimeout(function() { controller.abort(); }, timeoutMs);
     try {
         var opts = Object.assign({}, options || {}, { signal: controller.signal });
-        var res = await fetch(url, opts);
+        var target = new URL(url);
+        if (target.origin === SUPABASE_URL && target.pathname === '/rest/v1/filters') {
+            var settings = await new Promise(function (resolve) { browserAPI.storage.local.get('supabaseClientId', resolve); });
+            var clientId = settings && typeof settings.supabaseClientId === 'string' && settings.supabaseClientId.trim();
+            if (clientId) {
+                if (String(opts.method || 'GET').toUpperCase() === 'POST') {
+                    var body = JSON.parse(opts.body); body.client_id = clientId; opts.body = JSON.stringify(body);
+                } else target.searchParams.set('client_id', 'eq.' + clientId);
+            }
+        }
+        var res = await fetch(target.href, opts);
         clearTimeout(timer);
         return res;
     } catch (err) {
@@ -157,26 +170,12 @@ document.addEventListener('DOMContentLoaded', function() {
 
 function autoMigrateIfNeeded() {
     return new Promise(function(resolve) {
-        browserAPI.storage.local.get(
-            ['initialized_v620', 'mode', 'userSetMode', 'keywords'],
-            function(result) {
-                if (result.initialized_v620) { resolve(); return; }
-
-                var seed = Object.assign({}, DEFAULT_CONFIG);
-                if (result.userSetMode && result.mode) {
-                    seed.mode = result.mode;
-                    seed.userSetMode = true;
-                }
-                if (result.keywords) seed.keywords = result.keywords;
-
-                browserAPI.storage.local.set(seed, function() {
-                    browserAPI.storage.local.set({ initialized_v620: true }, function() {
-                        console.log('[Config] Auto-migrated to v6.20 defaults');
-                        resolve();
-                    });
-                });
-            }
-        );
+        browserAPI.storage.local.get(null, function(existing) {
+            var seed = {};
+            Object.keys(DEFAULT_CONFIG).forEach(function(key) { if (existing[key] === undefined) seed[key] = DEFAULT_CONFIG[key]; });
+            seed.initialized_v510 = true;
+            browserAPI.storage.local.set(seed, resolve);
+        });
     });
 }
 
@@ -406,6 +405,12 @@ function updateConfigSupabaseUI(enabled) {
 function loadConfig() {
     browserAPI.storage.local.get(DEFAULT_CONFIG, function(config) {
         var m = Object.assign({}, DEFAULT_CONFIG, config);
+        m.autoReloadOnComplete = false;
+        m.maxReloadsPerSession = 0;
+        var clientField = document.getElementById('supabaseClientId');
+        if (clientField) clientField.value = m.supabaseClientId || '';
+        var pullingField = document.getElementById('proactiveFeedPolling');
+        if (pullingField) pullingField.checked = m.proactiveFeedPolling === true;
 
         document.querySelectorAll('.mode-btn').forEach(function(btn) {
             btn.classList.toggle('active', btn.dataset.mode === m.mode);
@@ -556,25 +561,26 @@ async function loadFilters(forceRefresh) {
     }
 }
 
-function renderFilterCard(f) {
-    var config = f.filter_config || {};
-    var pk = Array.isArray(f.product_keywords)  ? f.product_keywords  : (config.product_names     || []);
-    var nk = Array.isArray(f.negative_keywords) ? f.negative_keywords : (config.negative_keywords || []);
-    var rk = Array.isArray(f.required_keywords) ? f.required_keywords : (config.required_keywords || []);
-    var lk = Array.isArray(f.location_keywords) ? f.location_keywords : [];
-
-    if (pk.length === 0 && Array.isArray(config.product_names))     pk = config.product_names;
-    if (nk.length === 0 && Array.isArray(config.negative_keywords)) nk = config.negative_keywords;
-    if (rk.length === 0 && Array.isArray(config.required_keywords)) rk = config.required_keywords;
-    if (lk.length === 0) {
-        lk = []
-            .concat(Array.isArray(config.countries) ? config.countries : [])
-            .concat(Array.isArray(config.states)    ? config.states    : []);
+// Explicit empty columns are clears; only null/missing columns fall back to legacy JSON.
+function filterKeywordValues(f) {
+    var cfg = f.filter_config || {};
+    function list(value) {
+        if (Array.isArray(value)) return value.filter(function(v) { return typeof v === 'string'; });
+        return typeof value === 'string' ? value.split(/[;\n\r]+/).map(function(v) { return v.trim(); }).filter(Boolean) : [];
     }
+    return {
+        product: list(f.product_keywords != null ? f.product_keywords : cfg.product_names || cfg.product_keywords),
+        negative: list(f.negative_keywords != null ? f.negative_keywords : cfg.negative_keywords),
+        required: list(f.required_keywords != null ? f.required_keywords : cfg.required_keywords),
+        location: Array.from(new Set(list(f.location_keywords != null ? f.location_keywords : cfg.locations || cfg.location_keywords)
+            .concat(list(f.countries != null ? f.countries : cfg.countries), list(f.states != null ? f.states : cfg.states), list(f.cities != null ? f.cities : cfg.cities))))
+    };
+}
 
-    var isLegacy = (!f.product_keywords || f.product_keywords.length === 0) &&
-                   f.filter_config &&
-                   (config.product_names && config.product_names.length > 0);
+function renderFilterCard(f) {
+    var values = filterKeywordValues(f);
+    var pk = values.product, nk = values.negative, rk = values.required, lk = values.location;
+    var isLegacy = f.product_keywords == null && !!f.filter_config;
 
     var isActive = f.is_active !== false;
     var isRunning = f.is_running === true;
@@ -661,6 +667,7 @@ async function editFilter(id) {
 
 function openFilterModal(filter) {
     editingFilterId = filter ? filter.id : null;
+    editingFilterSnapshot = filter ? JSON.parse(JSON.stringify(filter)) : null;
 
     var modal = document.getElementById('filterModal');
     var title = document.getElementById('filterModalTitle');
@@ -673,21 +680,8 @@ function openFilterModal(filter) {
         document.getElementById('editClientId').value   = filter.client_id || 'default';
         document.getElementById('editIsActive').checked = filter.is_active !== false;
 
-        var pk = (Array.isArray(filter.product_keywords)  && filter.product_keywords.length  > 0)
-            ? filter.product_keywords
-            : (Array.isArray(config.product_names) ? config.product_names : []);
-        var nk = (Array.isArray(filter.negative_keywords) && filter.negative_keywords.length > 0)
-            ? filter.negative_keywords
-            : (Array.isArray(config.negative_keywords) ? config.negative_keywords : []);
-        var rk = (Array.isArray(filter.required_keywords) && filter.required_keywords.length > 0)
-            ? filter.required_keywords
-            : (Array.isArray(config.required_keywords) ? config.required_keywords : []);
-        var lk = (Array.isArray(filter.location_keywords) && filter.location_keywords.length > 0)
-            ? filter.location_keywords
-            : [].concat(
-                Array.isArray(config.countries) ? config.countries : [],
-                Array.isArray(config.states)    ? config.states    : []
-            );
+        var values = filterKeywordValues(filter);
+        var pk = values.product, nk = values.negative, rk = values.required, lk = values.location;
 
         document.getElementById('editProductKeywords').value  = pk.join('\n');
         document.getElementById('editNegativeKeywords').value = nk.join('\n');
@@ -728,11 +722,16 @@ async function saveFilter() {
     saveBtn.textContent = 'Saving...';
 
     try {
-        var countries = locationKw.filter(function(l) {
-            return /^(in|us|uk|gb|ae|sa|ru|cn|au|ca|de|fr|jp|br|mx|it|es|kr|nl|za|sg|th|vn|id|my|ph|tr|eg|il|pk|bd|lk|np|india|usa|uk|uae)$/i.test(l)
-                || l.length === 2;
-        });
-        var states = locationKw.filter(function(l) { return countries.indexOf(l) === -1; });
+        var countries = locationKw.filter(function(value) { return !!LeadSyncCore.country(value); });
+        // Mirror only the edited keyword fields into legacy JSON, preserving every other
+        // country/contact/quantity/restriction option. A clear must not revive an old value.
+        var legacy = Object.assign({}, editingFilterSnapshot && editingFilterSnapshot.filter_config || {});
+        ['product_names', 'productNames', 'product_keywords', 'productKeywords', 'keywords', 'product_name', 'productName', 'products',
+         'negative_keywords', 'negativeKeywords', 'excluded_keywords', 'exclude_keywords', 'excludedKeywords',
+         'required_keywords', 'requiredKeywords', 'must_have_keywords', 'mustHaveKeywords',
+         'countries', 'country', 'allowed_countries', 'allowedCountries', 'country_name', 'states', 'state', 'state_name',
+         'cities', 'city', 'city_name', 'locations', 'location', 'location_keywords', 'sender_locations', 'senderLocations', 'regions', 'region'].forEach(function(key) { delete legacy[key]; });
+        Object.assign(legacy, { product_names: productKw, negative_keywords: negativeKw, required_keywords: requiredKw, locations: locationKw, countries: countries.map(LeadSyncCore.country) });
 
         var row = {
             filter_name: name,
@@ -742,12 +741,14 @@ async function saveFilter() {
             negative_keywords: negativeKw,
             required_keywords: requiredKw,
             location_keywords: locationKw,
+            filter_config: legacy,
             updated_at: new Date().toISOString()
         };
 
         var url, method;
         if (editingFilterId) {
-            url = SUPABASE_URL + '/rest/v1/filters?id=eq.' + editingFilterId;
+            url = SUPABASE_URL + '/rest/v1/filters?id=eq.' + encodeURIComponent(editingFilterId);
+            url += editingFilterSnapshot && editingFilterSnapshot.updated_at ? '&updated_at=eq.' + encodeURIComponent(editingFilterSnapshot.updated_at) : '&updated_at=is.null';
             method = 'PATCH';
         } else {
             url = SUPABASE_URL + '/rest/v1/filters';
@@ -765,6 +766,8 @@ async function saveFilter() {
             throw new Error('HTTP ' + res.status + ': ' + errText.substring(0, 200));
         }
 
+        var saved = await res.json();
+        if (!Array.isArray(saved) || !saved.length) throw new Error('No saved row: filter changed, was deleted, or the write is not permitted. Reload before retrying.');
         document.getElementById('filterModal').style.display = 'none';
         var wasEditing = !!editingFilterId;
         editingFilterId = null;
@@ -791,6 +794,8 @@ async function toggleFilter(id, isActive) {
             body: JSON.stringify({ is_active: isActive, updated_at: new Date().toISOString() })
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
+        var rows = await res.json();
+        if (!Array.isArray(rows) || !rows.length) throw new Error('Filter update matched no permitted row');
         showToast(isActive ? 'Filter enabled' : 'Filter disabled', 'success');
         await loadFilters(true);
         browserAPI.runtime.sendMessage({ action: 'REFRESH_FILTERS' });
@@ -810,13 +815,15 @@ async function deleteFilter(id) {
                 'apikey': SUPABASE_KEY,
                 'Authorization': 'Bearer ' + SUPABASE_KEY,
                 'Content-Type': 'application/json',
-                'Prefer': 'return=minimal'
+                'Prefer': 'return=representation'
             }
         });
         if (!res.ok) {
             var errText = await res.text();
             throw new Error('HTTP ' + res.status + ': ' + errText.substring(0, 200));
         }
+        var deleted = await res.json();
+        if (!Array.isArray(deleted) || !deleted.length) throw new Error('No permitted row was deleted');
         showToast('Filter deleted', 'success');
         await loadFilters(true);
         refreshCounts();
@@ -830,14 +837,7 @@ async function deleteFilter(id) {
 // BULK SYNC — parallel batches of 5
 // ============================================================
 async function bulkSyncKeywords() {
-    var cleanupLegacy = confirm(
-        'Sync keywords from filter_config → new keyword columns for ALL filters?\n\n' +
-        'Click OK to sync AND clear legacy filter_config afterward.\n' +
-        'Click Cancel to sync only (keep legacy for safety).'
-    );
-    var shouldClearLegacy = cleanupLegacy;
-
-    if (!confirm('Proceed with bulk sync?')) return;
+    if (!confirm('Fill missing keyword columns from legacy JSON? Existing values (including clears) and all other rules will be kept.')) return;
 
     var btn = document.getElementById('bulkSyncBtn');
     var orig = btn.textContent;
@@ -857,34 +857,23 @@ async function bulkSyncKeywords() {
         for (var i = 0; i < filters.length; i += BATCH) {
             var batch = filters.slice(i, i + BATCH);
             var promises = batch.map(function(f) {
-                var config = f.filter_config || {};
-                var pk = Array.isArray(config.product_names)     ? config.product_names     : [];
-                var nk = Array.isArray(config.negative_keywords) ? config.negative_keywords : [];
-                var rk = Array.isArray(config.required_keywords) ? config.required_keywords : [];
-                var lk = [].concat(
-                    Array.isArray(config.countries) ? config.countries : [],
-                    Array.isArray(config.states)    ? config.states    : []
-                );
+                var values = filterKeywordValues(f);
+                var updateBody = { updated_at: new Date().toISOString() };
+                if (f.product_keywords == null) updateBody.product_keywords = values.product;
+                if (f.negative_keywords == null) updateBody.negative_keywords = values.negative;
+                if (f.required_keywords == null) updateBody.required_keywords = values.required;
+                if (f.location_keywords == null) updateBody.location_keywords = values.location;
+                if (Object.keys(updateBody).length === 1) return Promise.resolve();
 
-                var updateBody = {
-                    product_keywords:  pk,
-                    negative_keywords: nk,
-                    required_keywords: rk,
-                    location_keywords: lk,
-                    updated_at: new Date().toISOString()
-                };
-
-                if (shouldClearLegacy) {
-                    updateBody.filter_config = null;
-                }
-
-                return sbFetch(SUPABASE_URL + '/rest/v1/filters?id=eq.' + f.id, {
+                var revision = f.updated_at ? '&updated_at=eq.' + encodeURIComponent(f.updated_at) : '&updated_at=is.null';
+                var missing = Object.keys(updateBody).filter(function (key) { return key !== 'updated_at'; }).map(function (key) { return '&' + key + '=is.null'; }).join('');
+                return sbFetch(SUPABASE_URL + '/rest/v1/filters?id=eq.' + encodeURIComponent(f.id) + revision + missing, {
                     method: 'PATCH',
                     headers: SB_HEADERS,
                     body: JSON.stringify(updateBody)
-                }).then(function(r) {
-                    if (r.ok) success++;
-                    else failed++;
+                }).then(async function(r) {
+                    var rows = r.ok ? await r.json() : null;
+                    if (Array.isArray(rows) && rows.length && String(rows[0].id) === String(f.id)) success++; else failed++;
                 }).catch(function() { failed++; });
             });
 
@@ -893,9 +882,8 @@ async function bulkSyncKeywords() {
         }
 
         showToast(
-            'Sync complete: ' + success + ' updated, ' + failed + ' failed' +
-            (shouldClearLegacy ? ' (legacy cleared)' : ''),
-            'success'
+            'Sync complete: ' + success + ' updated, ' + failed + ' failed (other rules preserved)',
+            failed ? 'error' : 'success'
         );
         await loadFilters(true);
     } catch (err) {
@@ -986,6 +974,10 @@ function getConfig() {
     if (paEl) c.purchaseAction = paEl.value;
 
     c.supabaseEnabled = supabaseEnabled;
+    c.supabaseClientId = (document.getElementById('supabaseClientId').value || '').trim();
+    c.proactiveFeedPolling = document.getElementById('proactiveFeedPolling').checked;
+    c.autoReloadOnComplete = false;
+    c.maxReloadsPerSession = 0;
 
     c.scoreWeights = {
         base: safeInt(document.getElementById('wBase').value, 50),
@@ -1039,53 +1031,49 @@ function saveAll() {
         showToast('Add at least one country before enabling strict mode', 'error');
         return;
     }
-    c.keywords = kw;
     c.userSetMode = true;
-    browserAPI.storage.local.set(c, function() {
-        browserAPI.runtime.sendMessage({ action: 'UPDATE_FULL_CONFIG', config: c });
-        browserAPI.runtime.sendMessage({ action: 'UPDATE_KEYWORDS', keywords: kw });
-        showToast('All settings saved!', 'success');
+    browserAPI.storage.local.get(['keywords', 'supabaseClientId'], function (saved) {
+        kw.location = saved.keywords && saved.keywords.location || [];
+        c.keywords = kw;
+        browserAPI.storage.local.set(c, function() {
+            browserAPI.runtime.sendMessage({ action: 'UPDATE_FULL_CONFIG', config: c });
+            browserAPI.runtime.sendMessage({ action: 'UPDATE_KEYWORDS', keywords: kw });
+            if ((saved.supabaseClientId || '') !== c.supabaseClientId) { loadFilters(true); refreshCounts(); }
+            showToast('All settings saved!', 'success');
+        });
     });
 }
 
+function scoringConfig(source) {
+    var out = {};
+    ['scoreWeights', 'scorePenalties', 'preferredCountries', 'preferredStates', 'strictCountryMode', 'allowedCountries', 'strictCountryRejectUnknown', 'minScore'].forEach(function (key) { out[key] = source[key]; });
+    return out;
+}
 function saveScoring() {
-    var c = getConfig();
-    browserAPI.storage.local.set({
-        scoreWeights: c.scoreWeights,
-        scorePenalties: c.scorePenalties,
-        preferredCountries: c.preferredCountries,
-        preferredStates: c.preferredStates,
-        strictCountryMode: c.strictCountryMode,
-        allowedCountries: c.allowedCountries,
-        strictCountryRejectUnknown: c.strictCountryRejectUnknown
-    }, function() {
-        browserAPI.runtime.sendMessage({ action: 'UPDATE_FULL_CONFIG', config: c });
+    var settings = scoringConfig(getConfig());
+    browserAPI.storage.local.set(settings, function() {
+        browserAPI.runtime.sendMessage({ action: 'UPDATE_FULL_CONFIG', config: settings });
         showToast('Scoring & country saved!', 'success');
     });
 }
-
 function resetScoring() {
     if (!confirm('Reset scoring + country to defaults?')) return;
-    browserAPI.storage.local.set({
-        scoreWeights: DEFAULT_CONFIG.scoreWeights,
-        scorePenalties: DEFAULT_CONFIG.scorePenalties,
-        preferredCountries: DEFAULT_CONFIG.preferredCountries,
-        preferredStates: DEFAULT_CONFIG.preferredStates,
-        strictCountryMode: DEFAULT_CONFIG.strictCountryMode,
-        allowedCountries: DEFAULT_CONFIG.allowedCountries,
-        strictCountryRejectUnknown: DEFAULT_CONFIG.strictCountryRejectUnknown
-    }, function() {
+    var settings = scoringConfig(DEFAULT_CONFIG);
+    browserAPI.storage.local.set(settings, function() {
         loadConfig();
-        browserAPI.runtime.sendMessage({ action: 'UPDATE_FULL_CONFIG', config: getConfig() });
+        browserAPI.runtime.sendMessage({ action: 'UPDATE_FULL_CONFIG', config: settings });
         showToast('Reset', 'success');
     });
 }
 
 function saveLocalKeywords() {
     var k = getLocalKeywords();
-    browserAPI.storage.local.set({ keywords: k }, function() {
-        browserAPI.runtime.sendMessage({ action: 'UPDATE_KEYWORDS', keywords: k });
-        showToast('Local keywords saved!', 'success');
+    browserAPI.storage.local.get('keywords', function (saved) {
+        k.location = saved.keywords && saved.keywords.location || [];
+        browserAPI.storage.local.set({ keywords: k }, function() {
+            browserAPI.runtime.sendMessage({ action: 'UPDATE_KEYWORDS', keywords: k });
+            showToast('Local keywords saved!', 'success');
+        });
     });
 }
 

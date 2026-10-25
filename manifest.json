@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IndiaMART BuyLead Assistant",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "description": "Reliable BuyLead monitoring, filter matching, and review assistant with Supabase CRM integration.",
   "homepage_url": "https://leadsync-tau-sand.vercel.app/",
   "permissions": [
@@ -25,7 +25,10 @@
         "https://app.indiamart.com/buyleads*",
         "https://app.indiamart.com/buyleads"
       ],
-      "js": ["src/network-interceptor.js"],
+      "js": [
+        "src/lead-core.js",
+        "src/network-interceptor.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
@@ -37,10 +40,11 @@
         "https://app.indiamart.com/buyleads"
       ],
       "js": [
+        "src/lead-core.js",
         "src/supabase-service.js",
         "src/bundle.js"
       ],
-      "run_at": "document_end"
+      "run_at": "document_start"
     }
   ],
   "background": {
@@ -97,5 +101,6 @@
         "path": "rules.json"
       }
     ]
-  }
+  },
+  "minimum_chrome_version": "111"
 }

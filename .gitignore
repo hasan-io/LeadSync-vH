@@ -1,3 +1,5 @@
 .agents
 skills-lock.json
 .gravitas
+node_modules/
+*.zip

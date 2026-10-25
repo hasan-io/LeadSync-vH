@@ -1,0 +1,18 @@
+{
+  "name": "leadsync-indiamart-extension",
+  "private": true,
+  "version": "5.1.0",
+  "description": "Manifest V3 extension; no runtime build step or bundled dependencies",
+  "scripts": {
+    "test": "node scripts/test.js",
+    "test:runtime": "node --test tests/runtime/*.test.js",
+    "check": "node scripts/check.js",
+    "test:compat": "node scripts/test-compat.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

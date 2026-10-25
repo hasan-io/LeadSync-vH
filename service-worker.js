@@ -1,24 +1,23 @@
+importScripts('src/lead-core.js', 'src/supabase-service.js', 'src/background-state.js');
+
 // service-worker.js
 // Background service worker — direct Supabase data management
 // Developed by Keyn Labs
-// Version 4.2.0
-// ============================================================================
-// CHANGELOG v4.2.0
-//   • Default config bumped to match bundle.js v6.2 (faster queue, bigger limits)
-//   • checkActiveFilters is now gated on an open IndiaMART tab
-//   • Uses chromealarms (60s) instead of setInterval — survives SW suspension
-//   • New storage schema key initialized_v620 → re-seeds faster defaults once
-//   • Retry-with-backoff on tab hydration for SET_MODE / TOGGLE_SUPABASE
-//   • SUPPABASE_CLEAR_BEFORE validates ISO date and returns structured errors
-//   • All tabs.sendMessage calls guarded against runtime.lastError
-// ============================================================================
+// Version 5.1.0 — durable leases/outbox, scoped filters and non-destructive defaults.
 
-console.log('🔧 BuyLead Assistant Service Worker v4.2.0');
+console.log('🔧 BuyLead Assistant Service Worker v5.1.0');
 console.log('📦 Developed by Keyn Labs');
 
 var browserAPI = (typeof browser !== 'undefined') ? browser : chrome;
 var cachedStatus = null;
 var SW_INSTANCE_ID = 'sw_' + Math.random().toString(36).substring(2, 10);
+var persistence = createLeadSyncBackground(browserAPI, new SupabaseService({ useProxy: false }), function (message) {
+    browserAPI.tabs.query({ url: ['https://seller.indiamart.com/*', 'https://app.indiamart.com/*'] }, function (tabs) {
+        (tabs || []).forEach(function (tab) { safeSendToTab(tab.id, message, function () {}); });
+    });
+});
+persistence.ready.then(function () { return persistence.drain(); }).catch(function (err) { console.error('[SW] Persistence recovery failed:', err.message); });
+
 
 function swLogEvent(level, event, data) {
     data = data || {};
@@ -57,12 +56,14 @@ var SUPABASE_URL = 'https://zvhuromubukylsxrsfiz.supabase.co';
 var SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp2aHVyb211YnVreWxzeHJzZml6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgwODI4MDYsImV4cCI6MjEwMzY1ODgwNn0.29J2uGHxFhPtEqRZvnXjaYpL-x4I0uEc2TT8u9d5PVw';
 
 // ============================================================
-// DEFAULT CONFIG — MIRRORS bundle.js v6.2
+// DEFAULT CONFIG — 5.1.0 (fill absent values only)
 // ============================================================
 var DEFAULT_CONFIG = {
     mode: 'AUTOMATIC',
     userSetMode: false,
     supabaseEnabled: true,
+    proactiveFeedPolling: false,
+    supabaseClientId: '',
     minScore: 60,
 
     // Speed limits
@@ -97,13 +98,13 @@ var DEFAULT_CONFIG = {
     loopIntervalMs: 250,
     loadMoreWaitMs: 900,
     maxStuckLoops: 3,
-    maxReloadsPerSession: 999999,
-    autoReloadOnComplete: true,
-    autoReloadDelayMs: 100,
+    maxReloadsPerSession: 0,
+    autoReloadOnComplete: false,
+    autoReloadDelayMs: 2500,
 
     // Popup (speed-tuned)
     autoMinimize: true,
-    popupTimeoutMs: 5000,
+    popupTimeoutMs: 15000,
     confirmationAnswer: 'yes',
     purchaseAction: 'close',
 
@@ -137,32 +138,16 @@ function sbHeaders(extra) {
 // INSTALLATION — seed config once per schema version
 // ============================================================
 browserAPI.runtime.onInstalled.addListener(function() {
-    console.log('[SW] BuyLead Assistant v4.2.0 installed');
+    console.log('[SW] BuyLead Assistant v5.1.0 installed');
     swLogEvent('INFO', 'app.initialization.completed', { reasonCode: 'SERVICE_WORKER_INSTALLED', result: 'INSTALLED' });
 
-    browserAPI.storage.local.get(['initialized_v620', 'mode', 'userSetMode'], function(result) {
-        if (result.initialized_v620) {
-            console.log('[SW] Config schema already at v6.20');
-            return;
-        }
-
-        // Preserve user-chosen mode if they've set it explicitly
-        var seed = Object.assign({}, DEFAULT_CONFIG);
-        if (result.userSetMode && result.mode) {
-            seed.mode = result.mode;
-            seed.userSetMode = true;
-        }
-
-        // Preserve any user keywords if present
-        browserAPI.storage.local.get('keywords', function(kres) {
-            if (kres && kres.keywords) seed.keywords = kres.keywords;
-
-            browserAPI.storage.local.set(seed, function() {
-                browserAPI.storage.local.set({ initialized_v620: true }, function() {
-                    console.log('[SW] ✅ Defaults v6.20 initialized (fast mode)');
-                });
-            });
+    browserAPI.storage.local.get(null, function (existing) {
+        var seed = {};
+        Object.keys(DEFAULT_CONFIG).forEach(function (key) {
+            if (existing[key] === undefined) seed[key] = DEFAULT_CONFIG[key];
         });
+        seed.initialized_v510 = true;
+        browserAPI.storage.local.set(seed);
     });
 
     setupAlarms();
@@ -187,6 +172,7 @@ var FILTER_CHECK_ALARM = 'buylead_filter_check';
 function setupAlarms() {
     try {
         browserAPI.alarms.create(FILTER_CHECK_ALARM, { periodInMinutes: 1 });
+        browserAPI.alarms.create('leadsync_outbox_retry', { periodInMinutes: 1 });
         console.log('[SW] ⏰ Filter-check alarm scheduled (1 min)');
     } catch (e) {
         console.warn('[SW] alarms.create failed:', e.message);
@@ -196,6 +182,7 @@ function setupAlarms() {
 if (browserAPI.alarms && browserAPI.alarms.onAlarm) {
     browserAPI.alarms.onAlarm.addListener(function(alarm) {
         if (alarm.name === FILTER_CHECK_ALARM) runGatedFilterCheck();
+        if (alarm.name === 'leadsync_outbox_retry') persistence.drain().catch(function (err) { console.warn('[SW] Outbox:', err.message); });
     });
 }
 
@@ -205,12 +192,12 @@ if (browserAPI.alarms && browserAPI.alarms.onAlarm) {
 // ============================================================
 function runGatedFilterCheck() {
     try {
-        browserAPI.tabs.query({ url: 'https://seller.indiamart.com/*' }, function(tabs) {
+        browserAPI.tabs.query({ url: ['https://seller.indiamart.com/*', 'https://app.indiamart.com/*'] }, function(tabs) {
             if (browserAPI.runtime.lastError) {
                 // Firefox may not support the url filter the same way — fall back to scanning
                 browserAPI.tabs.query({}, function(allTabs) {
                     var relevant = (allTabs || []).filter(function(t) {
-                        return t.url && t.url.indexOf('seller.indiamart.com') !== -1;
+                        return t.url && /^https:\/\/(seller|app)\.indiamart\.com\//.test(t.url);
                     });
                     if (relevant.length === 0) return;
                     checkActiveFilters();
@@ -226,54 +213,24 @@ function runGatedFilterCheck() {
     }
 }
 
+var filterSync = null;
+var workerFilters = new SupabaseService({ useProxy: false });
 async function checkActiveFilters() {
-    try {
-        var settings = await new Promise(function(resolve) {
-            browserAPI.storage.local.get(['supabaseEnabled'], function(result) { resolve(result); });
-        });
-
-        if (settings.supabaseEnabled === false) {
-            await browserAPI.storage.local.set({
-                hasActiveFilters: false,
-                activeFilterCount: 0,
-                lastFilterCheck: Date.now()
-            });
-            return;
-        }
-
-        var url = SUPABASE_URL + '/rest/v1/filters?is_active=eq.true&select=id,is_running,stats_scanned,stats_matched,stats_clicked';
-        var response = await fetch(url, { headers: sbHeaders() });
-        if (!response.ok) return;
-
-        var filters = await response.json();
-        var hasActiveFilters = filters.length > 0;
-
-        await browserAPI.storage.local.set({
-            hasActiveFilters: hasActiveFilters,
-            activeFilterCount: filters.length,
-            lastFilterCheck: Date.now()
-        });
-
-               try {
-            var p = browserAPI.runtime.sendMessage({
-                action: 'FILTER_STATUS_UPDATE',
-                hasActiveFilters: hasActiveFilters,
-                filterCount: filters.length,
-                filters: filters
-            });
-            if (p && typeof p.catch === 'function') {
-                p.catch(function() { /* no listeners */ });
-            }
-        } catch (e) { /* no listeners */ }
-    } catch (err) {
-        console.warn('[SW] checkActiveFilters failed:', err && err.message);
-    }
+    if (filterSync) return filterSync;
+    filterSync = (async function () {
+        var settings = await new Promise(function (resolve) { browserAPI.storage.local.get(['supabaseEnabled', 'supabaseClientId'], resolve); });
+        if (settings.supabaseEnabled === false) return false;
+        workerFilters.setClientId(settings.supabaseClientId || null);
+        var success = await workerFilters.loadFilters(true);
+        if (!success) return false;
+        var filters = workerFilters.getFilters();
+        browserAPI.storage.local.set({ hasActiveFilters: filters.length > 0, activeFilterCount: filters.length, lastFilterCheck: Date.now() });
+        return true;
+    })().finally(function () { filterSync = null; });
+    return filterSync;
 }
 
-// ============================================================
-// SUPABASE DATA OPERATIONS
-// ============================================================
-
+// Existing administrative operations retain their database contracts.
 async function sbClearAllLeads() {
     console.log('[SW] sbClearAllLeads called');
     try {
@@ -453,7 +410,7 @@ function broadcastToActiveTab(message, delays) {
         browserAPI.tabs.query({ active: true, currentWindow: true }, function(tabs) {
             if (browserAPI.runtime.lastError || !tabs || !tabs[0]) return;
             var tab = tabs[0];
-            if (!tab.url || tab.url.indexOf('seller.indiamart.com/bltxn') === -1) return;
+            if (!tab.url || !/^https:\/\/(seller|app)\.indiamart\.com\/(bltxn|buyleads)/.test(tab.url)) return;
             safeSendToTab(tab.id, message, function(response, err) {
                 if (err && idx < delays.length) {
                     idx++;
@@ -474,6 +431,25 @@ browserAPI.runtime.onMessage.addListener(function(request, sender, sendResponse)
         return true;
     }
 
+    if (sender && sender.id && sender.id !== browserAPI.runtime.id) {
+        sendResponse({ success: false, error: 'Untrusted sender' }); return false;
+    }
+    if (request.action === 'ACQUISITION_CLAIM') {
+        persistence.claim(request.leadId, request.attemptId, sender && sender.tab && sender.tab.id, request.timeoutMs).then(sendResponse, function (err) { sendResponse({ allowed: false, reason: 'PERSISTENCE_UNAVAILABLE', error: err.message }); });
+        return true;
+    }
+    if (request.action === 'ACQUISITION_COMPLETE') {
+        persistence.complete(request.leadId, request.attemptId, request.result || {}, sender && sender.tab && sender.tab.id).then(sendResponse, function (err) { sendResponse({ success: false, error: err.message }); });
+        return true;
+    }
+    if (request.action === 'CRM_SYNC_LEAD') {
+        persistence.enqueue(request.lead, request.outcome).then(function (result) {
+            sendResponse(result);
+            if (result.queued) persistence.drain().catch(function (err) { console.warn('[SW] Outbox drain:', err.message); });
+        }, function (err) { sendResponse({ queued: false, error: err.message }); });
+        return true;
+    }
+    if (request.action === 'GET_SYNC_STATUS') { persistence.status().then(sendResponse); return true; }
     console.log('[SW] Message:', request.action);
 
     // === LOGS ===
@@ -528,10 +504,10 @@ browserAPI.runtime.onMessage.addListener(function(request, sender, sendResponse)
     }
 
     if (request.action === 'CHECK_FILTERS') {
-        checkActiveFilters().then(function() {
+        checkActiveFilters().then(function(success) {
             browserAPI.storage.local.get(['hasActiveFilters', 'activeFilterCount'], function(result) {
                 sendResponse({
-                    success: true,
+                    success: !!success,
                     hasActiveFilters: result.hasActiveFilters || false,
                     filterCount: result.activeFilterCount || 0
                 });
@@ -542,8 +518,15 @@ browserAPI.runtime.onMessage.addListener(function(request, sender, sendResponse)
 
     // === PROXY SUPABASE FETCH (bypasses webpage CSP/CORS on IndiaMART) ===
     if (request.action === 'SUPABASE_FETCH') {
+        var proxyUrl;
+        try { proxyUrl = new URL(request.url); } catch (e) {}
+        var proxyMethod = String(request.options && request.options.method || 'GET').toUpperCase();
+        if (!proxyUrl || proxyUrl.origin !== SUPABASE_URL || proxyUrl.username || proxyUrl.password || !/^\/rest\/v1\/(filters|leads|lead_history)$/.test(proxyUrl.pathname) || ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE'].indexOf(proxyMethod) === -1) {
+            sendResponse({ error: 'Supabase proxy target rejected', status: 0 });
+            return false;
+        }
         (async function() {
-            var timeoutMs = request.timeoutMs || 15000;
+            var timeoutMs = Math.max(1000, Math.min(25000, Number(request.timeoutMs) || 15000));
             var controller = new AbortController();
             var timer = setTimeout(function() {
                 controller.abort();
@@ -556,9 +539,9 @@ browserAPI.runtime.onMessage.addListener(function(request, sender, sendResponse)
                 fetchOptions.signal = controller.signal;
 
                 var res = await fetch(fetchUrl, fetchOptions);
+                var resText = await res.text();
                 clearTimeout(timer);
                 var duration = Date.now() - startTime;
-                var resText = await res.text();
                 var headersObj = {};
                 if (res.headers && typeof res.headers.forEach === 'function') {
                     res.headers.forEach(function(val, key) {
@@ -626,6 +609,7 @@ browserAPI.runtime.onMessage.addListener(function(request, sender, sendResponse)
 
     // === SET_MODE with user tracking ===
     if (request.action === 'SET_MODE') {
+        if (['MONITOR', 'DRY_RUN', 'ASSISTED', 'AUTOMATIC', 'REVIEW'].indexOf(request.mode) === -1) { sendResponse({ success: false, error: 'Invalid mode' }); return false; }
         browserAPI.storage.local.set({
             mode: request.mode,
             userSetMode: true
@@ -674,7 +658,7 @@ browserAPI.runtime.onMessage.addListener(function(request, sender, sendResponse)
         'RESET_PANEL_POSITION', 'SET_AUTO_MINIMIZE', 'SET_CONFIRMATION_ANSWER',
         'SET_PURCHASE_ACTION', 'SET_AUTO_SCROLL', 'CLEAR_ALL_LOCAL_DATA',
         'GET_CONFIG', 'GET_KEYWORDS_DEBUG', 'RESET_DUPLICATES',
-        'SET_STRICT_COUNTRY', 'TEST_LOAD_MORE'
+        'SET_STRICT_COUNTRY', 'TEST_LOAD_MORE', 'SET_STOP_SOLD'
     ];
 
     if (forwardActions.indexOf(request.action) !== -1) {
@@ -741,43 +725,8 @@ browserAPI.runtime.onConnect.addListener(function(port) {
     }
 });
 
-// ============================================================
-// TAB UPDATE LISTENER — retry with backoff on hydration
-// ============================================================
-browserAPI.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
-    if (changeInfo.status !== 'complete') return;
-    if (!tab || !tab.url || tab.url.indexOf('seller.indiamart.com/bltxn') === -1) return;
-
-    console.log('[SW] IndiaMART page loaded');
-    runGatedFilterCheck();
-
-    browserAPI.storage.local.get(['mode', 'userSetMode', 'supabaseEnabled'], function(result) {
-        var mode = result.mode || 'AUTOMATIC';
-        var supabaseEnabled = result.supabaseEnabled !== false;
-        if (!result.userSetMode) {
-            mode = 'AUTOMATIC';
-            browserAPI.storage.local.set({ mode: 'AUTOMATIC' });
-        }
-
-        // Try at 2.5s, 4s, 6s, 8s — content script may attach late on slow networks
-        var delays = [2500, 4000, 6000, 8000];
-        var attempt = 0;
-        function push() {
-            if (attempt >= delays.length) return;
-            setTimeout(function() {
-                safeSendToTab(tabId, { action: 'SET_MODE', mode: mode }, function(r, err) {
-                    if (err) {
-                        attempt++;
-                        push();
-                        return;
-                    }
-                    // Once mode lands, also push supabase state
-                    safeSendToTab(tabId, { action: 'TOGGLE_SUPABASE', enabled: supabaseEnabled }, function() {});
-                });
-            }, delays[attempt] - (attempt > 0 ? delays[attempt - 1] : 0));
-        }
-        push();
-    });
+// Filter recovery is tab-gated; monitoring itself lives in the content script, not the popup.
+browserAPI.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
+    if (changeInfo.status === 'complete' && tab && /^https:\/\/(seller|app)\.indiamart\.com\/(bltxn|buyleads)/.test(tab.url || '')) runGatedFilterCheck();
 });
-
-console.log('[SW] BuyLead Assistant v4.2.0 loaded');
+setupAlarms();
