@@ -4,7 +4,7 @@
 
 This is the existing LeadSync extension, not a replacement CRM. It connects the locally loaded extension and authenticated IndiaMART seller portal to the existing Supabase-backed CRM. The CRM deployment, database schema and server-side authorization are not provisioned by this repository.
 
-**Current validation:** production-module tests pass locally. No logged-in IndiaMART acquisition, deployed CRM round trip, real Chrome MV3 suspension test or live latency measurement has been performed. See the [implementation report](ANTIGRAVITY_CHANGE_REPORT.md) and [live validation checklist](docs/LIVE_VALIDATION.md).
+**Current validation:** production-module tests pass locally. No logged-in IndiaMART acquisition, deployed CRM round trip, real Chrome MV3 suspension test or live latency measurement has been performed. See the [startup regression report](docs/STARTUP_REGRESSION_REPORT.md), [implementation report](ANTIGRAVITY_CHANGE_REPORT.md) and [live validation checklist](docs/LIVE_VALIDATION.md).
 
 ## Install or update safely
 

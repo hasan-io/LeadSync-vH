@@ -214,6 +214,7 @@
             ready = true;
             while (buffer.length) { var msg = buffer.shift(); msg.droppedCount = dropped; post(msg); }
             observeNativeContract();
+            post({ __leadsync_bridge_ready__: true }); // Diagnostic ACK, never acquisition evidence.
         }
         if (data.__leadsync_stream_control__) {
             paused = data.__leadsync_stream_control__ !== 'resume';
