@@ -15,7 +15,7 @@
                     <span class="subtitle">lead Sync Assistant</span>
                 </div>
             </div>
-            <span class="version">v7.0.0</span>
+            <span class="version">v5.1.0</span>
         </div>
 
         <!-- Connection Toggle -->
@@ -33,6 +33,17 @@
                 <input type="checkbox" id="configSupabaseToggle" checked>
                 <span class="slider"></span>
             </label>
+        </div>
+
+        <div class="section">
+            <div class="field">
+                <div class="field-label">CRM Client ID (optional)<span class="desc">Exact client_id from your CRM. Blank uses all filters permitted by your existing Supabase policy; this is not an authorization boundary.</span></div>
+                <div class="field-control"><input type="text" id="supabaseClientId" autocomplete="off" placeholder="All permitted clients"></div>
+            </div>
+            <div class="field">
+                <div class="field-label">Additional feed reads<span class="desc">Off by default. Opt in only if needed: re-read an observed same-origin GET after 15 seconds of portal inactivity, with backoff. Never replays acquisition requests.</span></div>
+                <div class="field-control"><label class="switch"><input type="checkbox" id="proactiveFeedPolling"><span class="slider"></span></label></div>
+            </div>
         </div>
 
         <!-- Tabs -->
@@ -251,9 +262,9 @@
             </div>
             <div class="section">
                 <div class="section-title">Auto-Reload</div>
-                <div class="field"><div class="field-label">Auto-Reload on Complete</div><div class="field-control"><input type="checkbox" id="autoReloadOnComplete" checked style="width:18px;height:18px;"></div></div>
-                <div class="field"><div class="field-label">Reload Delay (ms)</div><div class="field-control"><input type="number" id="autoReloadDelayMs" min="500" max="30000" step="100" value="1500"></div></div>
-                <div class="field"><div class="field-label">Max Reloads/Session</div><div class="field-control"><input type="number" id="maxReloadsPerSession" min="1" max="999999999" value="999999"></div></div>
+                <div class="field"><div class="field-label">Auto-Reload on Complete</div><div class="field-control"><input type="checkbox" id="autoReloadOnComplete" disabled title="Disabled: reload manually from the portal panel" style="width:18px;height:18px;"></div></div>
+                <div class="field"><div class="field-label">Reload Delay (ms)</div><div class="field-control"><input type="number" id="autoReloadDelayMs" disabled min="500" max="30000" step="100" value="1500"></div></div>
+                <div class="field"><div class="field-label">Max Reloads/Session</div><div class="field-control"><input type="number" id="maxReloadsPerSession" min="0" max="0" value="0" disabled></div></div>
             </div>
             <div class="actions">
                 <button class="btn-secondary" id="speedResetBtn" title="Reset only scroll/loop/cooldown to fast defaults">Reset to Speed Defaults</button>
@@ -265,7 +276,7 @@
             <div class="section">
                 <div class="section-title">Popup Handling</div>
                 <div class="field"><div class="field-label">Auto-Handle Popups</div><div class="field-control"><input type="checkbox" id="autoMinimize" checked style="width:18px;height:18px;"></div></div>
-                <div class="field"><div class="field-label">Popup Timeout (ms) <span class="desc">How long to wait before assuming no popup</span></div><div class="field-control"><input type="number" id="popupTimeoutMs" min="1000" max="60000" step="500" value="5000"></div></div>
+                <div class="field"><div class="field-label">Popup Timeout (ms) <span class="desc">Maximum wait for confirmed acquisition (timeout is unknown, not success)</span></div><div class="field-control"><input type="number" id="popupTimeoutMs" min="1000" max="60000" step="500" value="15000"></div></div>
                 <div class="field"><div class="field-label">Confirmation Answer</div><div class="field-control"><select id="confirmationAnswer"><option value="yes">YES</option><option value="no">NO</option></select></div></div>
                 <div class="field"><div class="field-label">Purchase Modal Action</div><div class="field-control"><select id="purchaseAction"><option value="close">Auto-close</option><option value="stop">Stop acquiring</option></select></div></div>
             </div>
@@ -376,9 +387,7 @@
                 <textarea id="editLocationKeywords" class="modal-textarea" rows="3" placeholder="india&#10;maharashtra"></textarea>
 
                 <div class="info-box" style="margin-top:16px;">
-                    <strong>Tip:</strong> v7 stores keywords only in the new columns
-                    (<code>product_keywords</code>, <code>negative_keywords</code>, etc.).
-                    Legacy <code>filter_config</code> is no longer written.
+                    <strong>Tip:</strong> Empty keyword fields are explicit clears. Edited keywords are mirrored to legacy JSON without removing contact, quantity, or restriction rules. A concurrent CRM edit must be reloaded before saving.
                 </div>
             </div>
             <div class="modal-footer">
@@ -390,6 +399,7 @@
 
     <div class="toast-container" id="toastContainer"></div>
 
+    <script src="../src/lead-core.js"></script>
     <script src="config.js"></script>
 </body>
 </html>

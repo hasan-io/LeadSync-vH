@@ -1,710 +1,338 @@
-/**
- * LeadSync Network Interceptor v5 — Passive Observation Edition
- * Runs in MAIN world at document_start.
- *
- * Transparently monitors read-only lead feed responses (XHR & fetch)
- * for IndiaMART BuyLead data as it arrives over the wire.
- *
- * Adheres strictly to security & reliability invariants:
- * - Read-only: Never modifies requests, never records cookies/auth tokens.
- * - No undocumented replay: Request body and template harvesting removed.
- * - Bounded buffer: Prevents memory growth with dropped-record accounting.
- * - Per-lead deduplication: Never starves a batch if only the first ID repeats.
- * - Safe type support: Supports string, URL, Request objects, and XHR responseType.
- */
+/* MAIN world, document_start. Observe the seller's traffic; never harvest session secrets. */
 (function () {
     'use strict';
-
-    // ── State & Bounded Cache ──────────────────────────────────────────
-    var _contentScriptReady = false;
-    var _buffer = []; // Max 50 items before content script signals ready
-    var MAX_BUFFER_SIZE = 50;
-    var _droppedBufferCount = 0;
-
-    // Per-lead dedup cache: leadId -> timestamp (bounded to 1000 items, 10 min TTL)
-    var _seenLeadIds = new Map();
-    var DEDUP_TTL_MS = 10 * 60 * 1000;
-    var MAX_DEDUP_SIZE = 1000;
-
-    // ── URL pattern sets for passive lead observation ───────────────────
-    var LEAD_URL_PATTERNS = [
-        /bltxn/i,
-        /buylead/i,
-        /getbuyerleads/i,
-        /GetBuyerLeads/i,
-        /buyleadlist/i,
-        /enquiry.*list/i,
-        /lead.*list/i,
-        /bltxnapi/i,
-        /\/bl\//i,
-        /getLeads/i,
-        /fetchLeads/i,
-        /buyer.*leads/i,
-        /getBuyLeadList/i,
-        /BLTxnList/i,
-        /buyerdiscovery/i,
-        /sellerbuylead/i,
-        /bl_feed/i,
-        /blfeed/i,
-        /leadstream/i
-    ];
-
-    function isLeadFeedUrl(url) {
-        if (!url || typeof url !== 'string') return false;
-        var u = url.toLowerCase();
-        // Ignore past leads, history, or consumed feed responses
-        // Explicitly exclude external non-IndiaMART traffic
-        if (u.indexOf('supabase.co') !== -1 || u.indexOf('chrome-extension:') !== -1 || u.indexOf('google') !== -1) {
-            return false;
-        }
-        // Ignore past leads, history, or consumed feed responses
-        if (u.indexOf('pastleads') !== -1 || u.indexOf('past_leads') !== -1 || u.indexOf('consumed') !== -1) {
-            return false;
-        }
-        for (var i = 0; i < LEAD_URL_PATTERNS.length; i++) {
-            if (LEAD_URL_PATTERNS[i].test(url)) return true;
-        }
-        return false;
+    var root = typeof window !== 'undefined' ? window : globalThis;
+    if (root.__leadsync_interceptor__) {
+        if (typeof module !== 'undefined' && module.exports) module.exports = root.__leadsync_interceptor__;
+        return;
     }
+    var Core = globalThis.LeadSyncCore || (typeof require === 'function' ? require('./lead-core.js') : null);
+    if (!Core) return;
+    var ready = false;
+    var paused = true;
+    var buffer = [];
+    var dropped = 0;
+    var seen = new Map();
+    var MAX_BUFFER = 100;
+    var MAX_SEEN = 2000;
+    var activeAttempt = null;
+    var dispatched = new Map();
+    var verifiedController = null;
+    var lastLeadFeedUrl = null;
+    var pullTimer = null;
+    var pullController = null;
+    var pullInProgress = false;
+    var lastNativeFeedAt = 0;
+    var pullDelay = 15000;
+    var optInPulling = false;
+    var origFetch = root.fetch;
+    // Remove historical copies of authentication headers. Cookies remain browser-managed.
+    try { sessionStorage.removeItem('bl_last_headers'); sessionStorage.removeItem('bl_last_lead_feed_url'); } catch (e) { }
 
-    // ── URL pattern sets for transaction & acquisition confirmation ────
-    var ACQUISITION_URL_PATTERNS = [
-        /submitlead/i,
-        /consumebuylead/i,
-        /purchasebuylead/i,
-        /buybl/i,
-        /bl_txn_submit/i,
-        /buyLeadService\/submit/i,
-        /bltxnapi\/.*submit/i,
-        /bltxn.*submit/i,
-        /bltxn.*consume/i
-    ];
-
-    function isAcquisitionUrl(url) {
-        if (!url || typeof url !== 'string') return false;
-        var u = url.toLowerCase();
-        for (var i = 0; i < ACQUISITION_URL_PATTERNS.length; i++) {
-            if (ACQUISITION_URL_PATTERNS[i].test(url)) return true;
-        }
-        return false;
-    }
-
-    function handleAcquisitionResponse(responseTextOrJson, sourceUrl) {
+    function parsedUrl(url) {
         try {
-            var data = null;
-            if (typeof responseTextOrJson === 'string') {
-                if (!responseTextOrJson.trim()) return;
-                try { data = JSON.parse(responseTextOrJson); } catch (pe) { return; }
-            } else if (responseTextOrJson && typeof responseTextOrJson === 'object') {
-                data = responseTextOrJson;
-            } else {
+            var u = new URL(url, root.location && root.location.href || 'https://seller.indiamart.com/');
+            return /^(?:https:|wss:)$/.test(u.protocol) && /(?:^|\.)indiamart\.com$/i.test(u.hostname) ? u : null;
+        } catch (e) { return null; }
+    }
+    function isAcquisitionUrl(url) {
+        var u = parsedUrl(url);
+        return !!u && /submitLead|consumeBuyLead|purchaseBuyLead|buybl|bl_txn_submit|buyLeadService\/submit|bltxn.*(?:submit|consume)|buyleads?\/.*(?:purchase|consume)/i.test(u.pathname);
+    }
+    function isLeadFeedUrl(url) {
+        var u = parsedUrl(url);
+        return !!u && !isAcquisitionUrl(url) && !/pastleads|past_leads|consumed|(?:pref|tab)=past/i.test(u.href) &&
+            /bltxn|buylead|getbuyerleads|buyer.*leads|enquiry.*list|lead.*list|\/bl\/|getLeads|fetchLeads|buyerdiscovery|bl_feed|blfeed|leadstream/i.test(u.pathname);
+    }
+    function safeUrl(url) { var u = parsedUrl(url); return u ? u.origin + u.pathname : ''; }
+    function post(msg) { if (root.postMessage) root.postMessage(msg, root.location && root.location.origin || '*'); }
+    function emitLog(level, event, reasonCode, context) {
+        post({ __leadsync_log__: true, schemaVersion: '1.0.0', timestamp: new Date().toISOString(), level: level, event: event, component: 'NetworkInterceptor', reasonCode: reasonCode || null, context: context || {} });
+    }
+    function extractLeads(data) {
+        if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { return null; } }
+        var result = [];
+        var walked = new Set();
+        function walk(value, depth) {
+            if (!value || typeof value !== 'object' || depth > 5 || walked.has(value)) return;
+            walked.add(value);
+            if (Array.isArray(value)) {
+                for (var i = 0; i < value.length && result.length < 5000; i++) {
+                    var item = value[i];
+                    if (item && !Array.isArray(item) && typeof item === 'object' && (Core.leadId(item, true) || item.queryProductName || item.product_name)) result.push(item);
+                    else walk(item, depth + 1);
+                }
                 return;
             }
-
-            var str = JSON.stringify(data).toLowerCase();
-            var isSoldOut = str.indexOf('sold out') !== -1 || str.indexOf('already sold') !== -1 || str.indexOf('quota exhausted') !== -1 || str.indexOf('already consumed') !== -1;
-            var isInsufficient = str.indexOf('insufficient balance') !== -1 || str.indexOf('buy points') !== -1 || str.indexOf('recharge') !== -1 || str.indexOf('balance exhausted') !== -1;
-            var isSuccess = !isSoldOut && !isInsufficient && (
-                data.CODE === '200' || data.CODE === 200 ||
-                data.STATUS === 'SUCCESS' || data.status === 'SUCCESS' ||
-                data.status === 200 || data.success === true ||
-                str.indexOf('success') !== -1 || str.indexOf('contacted') !== -1 ||
-                str.indexOf('mobile') !== -1 || str.indexOf('glusr_usr_ph_mobile') !== -1
-            );
-
-            var leadId = data.uniqueQueryId || data.queryId || data.leadId || data.query_id || (data.DATA && (data.DATA.uniqueQueryId || data.DATA.queryId)) || null;
-
-            var msg = {
-                __leadsync_lead_acquired__: true,
-                success: isSuccess,
-                leadId: leadId ? String(leadId) : null,
-                action: isSoldOut ? 'lost_race' : (isSuccess ? 'confirmed' : 'unknown'),
-                code: isInsufficient ? 'INSUFFICIENT_BALANCE' : null,
-                message: isSoldOut ? 'Lead sold out before click' : (isInsufficient ? 'Insufficient balance' : (isSuccess ? 'Acquisition confirmed via native controller' : 'Response parsed')),
-                sourceUrl: sanitizeUrl(sourceUrl),
-                ts: Date.now()
-            };
-
-            if (typeof window !== 'undefined' && typeof window.postMessage === 'function') {
-                window.postMessage(msg, '*');
-            }
-        } catch (e) { }
-    }
-
-    function sanitizeUrl(rawUrl) {
-        if (!rawUrl) return '';
-        try {
-            var parsed = new URL(rawUrl, window.location.href);
-            // Retain path and non-sensitive query params
-            return parsed.pathname + parsed.search;
-        } catch (e) {
-            return String(rawUrl).substring(0, 150);
+            ['DATA', 'data', 'leads', 'LEADS', 'result', 'results', 'response', 'Response', 'buyerList', 'enquiryList', 'buyLeadList', 'list'].forEach(function (k) { walk(value[k], depth + 1); });
         }
+        walk(data, 0);
+        return result.length ? result : null;
     }
-
-    function generateTraceId(leadId) {
-        if (leadId) {
-            var str = String(leadId).trim();
-            var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
-            for (var i = 0; i < str.length; i++) {
-                var ch = str.charCodeAt(i);
-                h1 = Math.imul(h1 ^ ch, 2654435761);
-                h2 = Math.imul(h2 ^ ch, 1597334677);
-            }
-            h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-            h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-            var hex = ('00000000' + (h1 >>> 0).toString(16)).slice(-8) + ('00000000' + (h2 >>> 0).toString(16)).slice(-8);
-            return 'tr_' + hex;
-        }
-        return 'tr_' + Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
-    }
-
-    function emitLog(level, event, reasonCode, context, metrics, error) {
-        try {
-            var logMsg = {
-                __leadsync_log__: true,
-                schemaVersion: '1.0.0',
-                timestamp: new Date().toISOString(),
-                level: level || 'INFO',
-                event: event,
-                component: 'NetworkInterceptor',
-                reasonCode: reasonCode || null,
-                context: context || {},
-                metrics: metrics || null,
-                error: error ? { message: error.message || String(error) } : null
-            };
-            if (typeof window !== 'undefined' && typeof window.postMessage === 'function') {
-                window.postMessage(logMsg, '*');
-            }
-        } catch (e) { }
-    }
-
-    // ── Extract lead array from IndiaMART API shapes ────────────────────
-    function extractLeads(data) {
-        if (!data) return null;
-        if (Array.isArray(data)) return data.length ? data : null;
-
-        // Nested CODE/DATA wrapper
-        if (data.CODE === '200' || data.CODE === 200) {
-            var d = data.DATA || data.data;
-            if (Array.isArray(d)) return d.length ? d : null;
-            if (d && typeof d === 'object') {
-                var candidates = ['leads', 'buyLeadList', 'buyerList', 'enquiryList', 'result', 'list'];
-                for (var c = 0; c < candidates.length; c++) {
-                    if (d[candidates[c]] && Array.isArray(d[candidates[c]])) return d[candidates[c]];
-                }
-            }
-        }
-
-        // Standard REST wrappers
-        var wrappers = ['data', 'leads', 'result', 'response', 'buyerList', 'enquiryList', 'buyLeadList', 'DATA', 'LEADS'];
-        for (var w = 0; w < wrappers.length; w++) {
-            var val = data[wrappers[w]];
-            if (val && Array.isArray(val) && val.length) return val;
-            if (val && typeof val === 'object') {
-                var inner = ['leads', 'buyLeadList', 'buyerList', 'enquiryList', 'result'];
-                for (var ii = 0; ii < inner.length; ii++) {
-                    if (val[inner[ii]] && Array.isArray(val[inner[ii]]) && val[inner[ii]].length) return val[inner[ii]];
-                }
-            }
-        }
-        return null;
-    }
-
-    // ── Clean & Deduplicate Individual Leads ───────────────────────────
     function cleanAndDedupLeads(rawLeads) {
         var now = Date.now();
-        // Prune stale dedup entries periodically
-        if (_seenLeadIds.size > MAX_DEDUP_SIZE) {
-            _seenLeadIds.forEach(function (ts, id) {
-                if (now - ts > DEDUP_TTL_MS) _seenLeadIds.delete(id);
-            });
-        }
-
         var result = [];
-        for (var i = 0; i < rawLeads.length; i++) {
-            var item = rawLeads[i];
-            if (!item || typeof item !== 'object') continue;
-
-            var id = String(item.uniqueQueryId || item.unique_query_id || item.query_id || item.queryId || item.QUERY_ID || item.leadId || item.lead_id || item.LEAD_ID || item.id || item.ID || '').trim();
-            if (id) {
-                var lastSeen = _seenLeadIds.get(id);
-                if (lastSeen && (now - lastSeen < DEDUP_TTL_MS)) {
-                    continue; // Skip seen lead
-                }
+        rawLeads.forEach(function (raw) {
+            var lead = Core.normalizeLead(raw);
+            if (!lead) return;
+            if (!lead.queryProductName && !lead.queryMessage && !lead.queryMcatName && !lead.senderCity && !lead.senderState && !lead.senderCountryIso && !lead.hasMobile && !lead.hasPhone && !lead.hasEmail && !lead.hasWhatsapp) return;
+            var sig = JSON.stringify(lead);
+            var prior = lead.uniqueQueryId && seen.get(lead.uniqueQueryId);
+            if (prior && prior.signature === sig && now - prior.at < 30000) return;
+            // Enriched location/contact/quantity data must be re-emitted for the same inquiry.
+            if (lead.uniqueQueryId) {
+                seen.delete(lead.uniqueQueryId);
+                seen.set(lead.uniqueQueryId, { signature: sig, at: now });
             }
-
-            // Create sanitized canonical representation for passive observation (supports all IndiaMART API variants)
-            var canonicalLead = {
-                uniqueQueryId: id || null,
-                traceId: generateTraceId(id),
-                queryProductName: item.queryProductName || item.productName || item.PRD_NAME || item.prd_name || item.product_name || item.subject || item.SUBJECT || item.title || item.TITLE || '',
-                queryMessage: item.queryMessage || item.message || item.MESSAGE || item.desc || item.DESC || item.description || item.DESCRIPTION || item.requirement || item.REQUIREMENT || '',
-                queryMcatName: item.queryMcatName || item.mcat_name || item.mcatName || item.MCAT_NAME || item.category || '',
-                senderCity: item.senderCity || item.city || item.CITY || item.GLUSR_USR_CITY || item.glusr_usr_city || '',
-                senderState: item.senderState || item.state || item.STATE || item.GLUSR_USR_STATE || item.glusr_usr_state || '',
-                senderCountryIso: item.senderCountryIso || item.countryIso || item.country || item.COUNTRY || item.GLUSR_USR_COUNTRY_ISO || item.glusr_usr_country_iso || null,
-                hasMobile: !!(item.senderMobile || item.sender_mobile || item.mobile || item.MOBILE || item.GLUSR_USR_PH_MOBILE || item.glusr_usr_ph_mobile || item.mobile_alt || item.senderMobileAlt),
-                hasPhone: !!(item.senderPhone || item.sender_phone || item.phone || item.PHONE || item.phone_alt || item.senderPhoneAlt),
-                hasEmail: !!(item.senderEmail || item.sender_email || item.email || item.EMAIL || item.GLUSR_USR_EMAIL || item.glusr_usr_email || item.email_alt || item.senderEmailAlt),
-                source: 'NETWORK_PASSIVE',
-                observedAt: now
-            };
-            if (!canonicalLead.queryProductName && !canonicalLead.queryMessage && !canonicalLead.queryMcatName &&
-                !canonicalLead.senderCity && !canonicalLead.senderState && !canonicalLead.senderCountryIso &&
-                !canonicalLead.hasMobile && !canonicalLead.hasPhone && !canonicalLead.hasEmail) {
-                continue;
-            }
-            result.push(canonicalLead);
-            if (id) _seenLeadIds.set(id, now);
-        }
+            lead.observedAt = now;
+            result.push(lead);
+        });
+        while (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value);
         return result;
     }
-
-    // ── Build and send/buffer a PASSIVE LEADS message ───────────────────
-    function handleLeadResponse(parsedOrText, sourceUrl) {
-        var t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
-        var sanitizedUrl = sanitizeUrl(sourceUrl);
-        emitLog('DEBUG', 'network.response.observed', null, { url: sanitizedUrl });
-
+    function handleLeadResponse(payload, sourceUrl, requestMeta) {
         try {
-            var data = null;
-            if (typeof parsedOrText === 'string') {
-                if (!parsedOrText.trim()) return;
-                try {
-                    data = JSON.parse(parsedOrText);
-                } catch (pe) {
-                    emitLog('DEBUG', 'network.payload.rejected', 'INVALID_JSON', { url: sanitizedUrl });
-                    return;
-                }
-            } else if (parsedOrText && typeof parsedOrText === 'object') {
-                data = parsedOrText;
-            } else {
-                emitLog('DEBUG', 'network.payload.rejected', 'UNSUPPORTED_TYPE', { url: sanitizedUrl });
-                return;
+            var leads = extractLeads(payload);
+            if (!leads) return;
+            // A replay candidate must be an observed, successful, same-origin read-only GET.
+            var u = parsedUrl(sourceUrl);
+            var sensitiveQuery = false;
+            if (u) u.searchParams.forEach(function (value, key) { if (/auth|token|csrf|cookie|key|session|glusr|glid|password|signature/i.test(key)) sensitiveQuery = true; });
+            if (requestMeta && requestMeta.method === 'GET' && !sensitiveQuery && u && root.location && u.origin === root.location.origin && !requestMeta.hadSensitiveHeaders && isLeadFeedUrl(sourceUrl)) {
+                lastLeadFeedUrl = u.href;
+                if (!requestMeta.proactive) lastNativeFeedAt = Date.now();
             }
-
-            var rawLeads = extractLeads(data);
-            if (!rawLeads || !rawLeads.length) {
-                emitLog('TRACE', 'network.payload.rejected', 'NO_LEADS_FOUND', { url: sanitizedUrl });
-                return;
+            var clean = cleanAndDedupLeads(leads);
+            if (!clean.length) return;
+            var msg = { __leadsync_network__: true, __leadsync_passive_lead__: true, type: '__leadsync_passive_lead__', leads: clean, sourceUrl: safeUrl(sourceUrl), ts: Date.now(), droppedCount: dropped };
+            if (ready) post(msg);
+            else {
+                if (buffer.length >= MAX_BUFFER) { buffer.shift(); dropped++; }
+                buffer.push(msg);
             }
-
-            // Lock in verified lead feed URL for proactive pulling from authentic traffic
-            if (sourceUrl && typeof sourceUrl === 'string' && isLeadFeedUrl(sourceUrl)) {
-                _lastLeadFeedUrl = sourceUrl;
-            }
-
-            var validLeads = cleanAndDedupLeads(rawLeads);
-            if (!validLeads.length) return;
-
-            var duration = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
-            emitLog('INFO', 'network.payload.parsed', 'SUCCESS', { url: sanitizedUrl, leadCount: validLeads.length }, { leadCount: validLeads.length, durationMs: duration });
-
-            var msg = {
-                __leadsync_network__: true,
-                __leadsync_passive_lead__: true,
-                type: '__leadsync_passive_lead__',
-                leads: validLeads,
-                sourceUrl: sanitizedUrl,
-                ts: Date.now(),
-                droppedCount: _droppedBufferCount
-            };
-
-            if (_contentScriptReady) {
-                window.postMessage(msg, '*');
-            } else {
-                if (_buffer.length >= MAX_BUFFER_SIZE) {
-                    _buffer.shift(); // Evict oldest
-                    _droppedBufferCount++;
-                }
-                _buffer.push(msg);
-            }
-        } catch (e) {
-            emitLog('ERROR', 'network.capture.failed', 'EXCEPTION', { url: sanitizedUrl }, null, e);
-        }
+            emitLog('DEBUG', 'network.payload.parsed', 'LEADS_NORMALIZED', { count: clean.length, url: safeUrl(sourceUrl) });
+        } catch (e) { emitLog('WARN', 'network.payload.rejected', 'INVALID_PAYLOAD'); }
     }
-
-    function flushBuffer() {
-        while (_buffer.length > 0) {
-            var msg = _buffer.shift();
-            msg.droppedCount = _droppedBufferCount;
-            window.postMessage(msg, '*');
-        }
-    }
-
-    // ── Listen for content script signals & direct controller dispatch ──
-    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-        window.addEventListener('message', function (evt) {
-            if (!evt || !evt.data || evt.source !== window) return;
-            if (evt.data.__leadsync_ready__) {
-                _contentScriptReady = true;
-                flushBuffer();
-                startProactiveStreamPuller();
-            }
-            if (evt.data.__leadsync_stream_control__ === 'pause') {
-                _streamPullerPaused = true;
-                stopProactiveStreamPuller();
-            } else if (evt.data.__leadsync_stream_control__ === 'resume') {
-                _streamPullerPaused = false;
-                startProactiveStreamPuller();
-            }
-            // Direct Native Controller Dispatch (Optimization 4)
-            if (evt.data.__leadsync_dispatch_lead__) {
-                try {
-                    var dLeadId = evt.data.leadId;
-                    if (typeof dLeadId === 'string' && dLeadId.indexOf('api_') === 0) {
-                        dLeadId = dLeadId.replace(/^api_/, '');
-                    }
-                    if (typeof dLeadId === 'string') {
-                        var numMatch = dLeadId.match(/\d{6,}/);
-                        if (numMatch) dLeadId = numMatch[0];
-                    }
-                    if (typeof window.blTxnController !== 'undefined' && typeof window.blTxnController.submitLead === 'function') {
-                        window.blTxnController.submitLead(dLeadId);
-                    }
-                } catch (de) { }
-            }
-        });
-    }
-
-
-    // ═══════════════════════════════════════════════════════════════
-    // PROACTIVE DIRECT STREAM PULLER (Route A Fast-Path)
-    // Proactively pulls IndiaMART's active BuyLead stream endpoint in-page
-    // every ~950ms, bypassing portal UI delays and notification banners.
-    // ═══════════════════════════════════════════════════════════════
-    var _lastLeadFeedUrl = null;
-    var _lastAuthHeaders = {};
-    try {
-        if (typeof sessionStorage !== 'undefined') {
-            var _cachedFeed = sessionStorage.getItem('bl_last_lead_feed_url');
-            if (_cachedFeed && isLeadFeedUrl(_cachedFeed)) {
-                _lastLeadFeedUrl = _cachedFeed;
-            }
-            var _cachedHeaders = sessionStorage.getItem('bl_last_headers');
-            if (_cachedHeaders) {
-                try { _lastAuthHeaders = JSON.parse(_cachedHeaders) || {}; } catch (e) { }
-            }
-        }
-    } catch (e) { }
-
-    function saveAuthHeaders(headers) {
-        if (!headers || typeof headers !== 'object') return;
-        var updated = false;
-        for (var k in headers) {
-            if (headers.hasOwnProperty(k) && typeof headers[k] === 'string' && headers[k].trim()) {
-                var lk = k.toLowerCase();
-                if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1 || lk.indexOf('csrf') !== -1 ||
-                    lk.indexOf('glid') !== -1 || lk.indexOf('cookie') !== -1 || lk.indexOf('user') !== -1 ||
-                    lk === 'x-requested-with' || lk.indexOf('key') !== -1 || lk.indexOf('app') !== -1) {
-                    _lastAuthHeaders[k] = headers[k];
-                    updated = true;
-                }
-            }
-        }
-        if (updated) {
-            try {
-                if (typeof sessionStorage !== 'undefined') {
-                    sessionStorage.setItem('bl_last_headers', JSON.stringify(_lastAuthHeaders));
-                }
-            } catch (e) { }
-        }
-    }
-
-    function getLastAuthHeaders() {
-        return _lastAuthHeaders;
-    }
-    var _pullerTimer = null;
-    var _pullInProgress = false;
-    var _streamPullerPaused = false;
-
-    function getLastLeadFeedUrl() {
-        return _lastLeadFeedUrl;
-    }
-
-    function setLastLeadFeedUrl(url) {
-        if (typeof url === 'string' && url.trim()) {
-            _lastLeadFeedUrl = url.trim();
-            try {
-                if (typeof sessionStorage !== 'undefined') {
-                    sessionStorage.setItem('bl_last_lead_feed_url', _lastLeadFeedUrl);
-                }
-            } catch (e) { }
-        } else {
-            _lastLeadFeedUrl = null;
-            try {
-                if (typeof sessionStorage !== 'undefined') {
-                    sessionStorage.removeItem('bl_last_lead_feed_url');
-                }
-            } catch (e) { }
-        }
-    }
-
-    function pullLeadStream(overrideUrl) {
-        if (_pullInProgress || _streamPullerPaused) return Promise.resolve(null);
-        if (typeof window === 'undefined') return Promise.resolve(null);
-
-        var href = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
-        // Safety: Do not poll on Past Leads or non-bltxn pages
-        if (href.indexOf('pastleads') !== -1 || href.indexOf('consumed') !== -1 || href.indexOf('bltxn') === -1) {
-            return Promise.resolve(null);
-        }
-
-        var targetUrl = overrideUrl || _lastLeadFeedUrl;
-        // Strictly avoid guessing or hitting dead hardcoded endpoints that 404
-        if (!targetUrl) {
-            return Promise.resolve(null);
-        }
-
-        _pullInProgress = true;
-
-        var fetchFn = origFetch || (typeof window !== 'undefined' ? window.fetch : null);
-        if (typeof fetchFn !== 'function') {
-            _pullInProgress = false;
-            return Promise.resolve(null);
-        }
-
-        return fetchFn(targetUrl, {
-            method: 'GET',
-            credentials: 'include',
-            headers: Object.assign({
-                'X-Requested-With': 'XMLHttpRequest',
-                'Accept': 'application/json, text/javascript, */*; q=0.01'
-            }, _lastAuthHeaders)
-        }).then(function (res) {
-            if (res && res.status >= 200 && res.status < 300) {
-                return res.text();
-            }
-            // Invalidate if endpoint returns 404/410 to prevent repetitive bad requests
-            if (res && (res.status === 404 || res.status === 410)) {
-                if (targetUrl === _lastLeadFeedUrl) {
-                    _lastLeadFeedUrl = null;
-                }
-            }
-            return null;
-        }).then(function (text) {
-            _pullInProgress = false;
-            if (text) {
-                handleLeadResponse(text, targetUrl);
-            }
-            return text;
-        }).catch(function () {
-            _pullInProgress = false;
-            return null;
-        });
-    }
-
-    function startProactiveStreamPuller() {
-        if (_pullerTimer) return;
-        var baseInterval = 3000; // 3000ms base (2-4 seconds background polling)
-
-        function scheduleNext() {
-            var jitter = Math.floor(Math.random() * 2000) - 1000; // 2000ms - 4000ms
-            var delay = Math.max(2000, Math.min(4000, baseInterval + jitter));
-            _pullerTimer = setTimeout(function () {
-                var p = pullLeadStream();
-                if (p && typeof p.finally === 'function') {
-                    p.finally(function () {
-                        if (_contentScriptReady && !_streamPullerPaused) {
-                            scheduleNext();
-                        } else {
-                            _pullerTimer = null;
-                        }
-                    });
-                } else {
-                    if (_contentScriptReady && !_streamPullerPaused) {
-                        scheduleNext();
-                    } else {
-                        _pullerTimer = null;
-                    }
-                }
-            }, delay);
-        }
-
-        scheduleNext();
-    }
-
-    function stopProactiveStreamPuller() {
-        if (_pullerTimer) {
-            clearTimeout(_pullerTimer);
-            _pullerTimer = null;
-        }
-        _pullInProgress = false;
-    }
-
-    // ── Patch XMLHttpRequest ────────────────────────────────────────────
-    var OrigXHR = typeof window !== 'undefined' ? window.XMLHttpRequest : null;
-    if (OrigXHR && OrigXHR.prototype) {
-        function PatchedXHR() {
-            var xhr = new OrigXHR();
-            var _url = '';
-            var _isLead = false;
-
-            var origOpen = xhr.open.bind(xhr);
-            var _isAcq = false;
-            xhr.open = function (method, url) {
-                _url = typeof url === 'string' ? url : (url && url.toString ? url.toString() : '');
-                _isLead = isLeadFeedUrl(_url);
-                _isAcq = isAcquisitionUrl(_url);
-                return origOpen.apply(xhr, arguments);
-            };
-
-            var capturedReqHeaders = {};
-            var origSetHeader = xhr.setRequestHeader ? xhr.setRequestHeader.bind(xhr) : null;
-            xhr.setRequestHeader = function (header, value) {
-                if (header && value) {
-                    capturedReqHeaders[header] = value;
-                    if (_isLead || _isAcq) saveAuthHeaders(capturedReqHeaders);
-                }
-                if (origSetHeader) return origSetHeader(header, value);
-            };
-
-            var origSend = xhr.send.bind(xhr);
-            xhr.send = function () {
-                if (_isLead || _isAcq) {
-                    saveAuthHeaders(capturedReqHeaders);
-                }
-                if (_isLead || _isAcq) {
-                    var capturedUrl = _url;
-                    var captureLead = _isLead;
-                    var captureAcq = _isAcq;
-                    xhr.addEventListener('load', function () {
-                        try {
-                            if (xhr.status >= 200 && xhr.status < 300) {
-                                var resp = (xhr.responseType === '' || xhr.responseType === 'text')
-                                    ? xhr.responseText
-                                    : (xhr.responseType === 'json' ? xhr.response : null);
-                                if (resp) {
-                                    if (captureLead) handleLeadResponse(resp, capturedUrl);
-                                    if (captureAcq) handleAcquisitionResponse(resp, capturedUrl);
-                                }
-                            }
-                        } catch (e) {}
-                    }, { once: true });
-                }
-                return origSend.apply(xhr, arguments);
-            };
-
-            return xhr;
-        }
-
-        PatchedXHR.prototype = OrigXHR.prototype;
-        try {
-            PatchedXHR.UNSENT = 0;
-            PatchedXHR.OPENED = 1;
-            PatchedXHR.HEADERS_RECEIVED = 2;
-            PatchedXHR.LOADING = 3;
-            PatchedXHR.DONE = 4;
-        } catch (e) {}
-        window.XMLHttpRequest = PatchedXHR;
-    }
-
-    // ── Patch fetch ─────────────────────────────────────────────────────
-    var origFetch = typeof window !== 'undefined' ? window.fetch : null;
-    if (origFetch) {
-        window.fetch = function (input) {
-            var url = typeof input === 'string'
-                ? input
-                : (input && input.url)
-                    ? input.url
-                    : (input && typeof input.toString === 'function')
-                        ? input.toString()
-                        : '';
-
-            var isLead = isLeadFeedUrl(url);
-            var isAcq = isAcquisitionUrl(url);
-            if (isLead || isAcq) {
-                var initOpts = arguments[1];
-                if (initOpts && initOpts.headers) {
-                    if (typeof initOpts.headers.forEach === 'function') {
-                        var hObj = {};
-                        initOpts.headers.forEach(function (v, k) { hObj[k] = v; });
-                        saveAuthHeaders(hObj);
-                    } else if (typeof initOpts.headers === 'object') {
-                        saveAuthHeaders(initOpts.headers);
-                    }
-                }
-            }
-            var p = origFetch.apply(this, arguments);
-
-            if (isLead || isAcq) {
-                var capturedUrl = url;
-                var captureLead = isLead;
-                var captureAcq = isAcq;
-                p = p.then(function (response) {
-                    if (response && response.status >= 200 && response.status < 300) {
-                        var cloned = response.clone();
-                        cloned.text().then(function (text) {
-                            if (text) {
-                                if (captureLead) handleLeadResponse(text, capturedUrl);
-                                if (captureAcq) handleAcquisitionResponse(text, capturedUrl);
-                            }
-                        }).catch(function () {});
-                    }
-                    return response;
-                });
-            }
-            return p;
-        };
-    }
-
-    // ── Patch WebSocket (zero-overhead passive message observer) ───────────
-    var OrigWebSocket = typeof window !== 'undefined' ? window.WebSocket : null;
-    if (OrigWebSocket) {
-        function PatchedWebSocket(url, protocols) {
-            var ws = protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
-            var isLeadWs = isLeadFeedUrl(typeof url === 'string' ? url : '');
-            ws.addEventListener('message', function (event) {
-                try {
-                    if (event && event.data) {
-                        if (isLeadWs || (typeof event.data === 'string' && (event.data.indexOf('query') !== -1 || event.data.indexOf('lead') !== -1 || event.data.indexOf('buylead') !== -1))) {
-                            handleLeadResponse(event.data, typeof url === 'string' ? url : 'ws://indiamart');
-                        }
-                    }
-                } catch (e) { }
+    function requestIds(url, body) {
+        var ids = new Set();
+        var keys = /^(?:uniquequeryid|unique_query_id|query_id|queryid|leadid|lead_id|eto_ofr_display_id|offerid|offer_id|blid|enquiryid|enquiry_id)$/i;
+        function visit(obj, depth) {
+            if (!obj || typeof obj !== 'object' || depth > 4) return;
+            Object.keys(obj).slice(0, 100).forEach(function (k) {
+                if (keys.test(k)) { var value = Core.id(obj[k]); if (value) ids.add(value); }
+                else if (obj[k] && typeof obj[k] === 'object') visit(obj[k], depth + 1);
             });
-            return ws;
         }
-        PatchedWebSocket.prototype = OrigWebSocket.prototype;
-        try {
-            PatchedWebSocket.CONNECTING = 0;
-            PatchedWebSocket.OPEN = 1;
-            PatchedWebSocket.CLOSING = 2;
-            PatchedWebSocket.CLOSED = 3;
-        } catch (e) { }
-        window.WebSocket = PatchedWebSocket;
+        try { new URL(url, root.location.href).searchParams.forEach(function (v, k) { if (keys.test(k) && Core.id(v)) ids.add(Core.id(v)); }); } catch (e) { }
+        if (typeof body === 'string' && body.length < 262144) {
+            try { visit(JSON.parse(body), 0); } catch (e) {
+                try { new URLSearchParams(body).forEach(function (v, k) { if (keys.test(k) && Core.id(v)) ids.add(Core.id(v)); }); } catch (e2) { }
+            }
+        } else if (body && typeof body.forEach === 'function') {
+            try { body.forEach(function (v, k) { if (keys.test(k) && Core.id(v)) ids.add(Core.id(v)); }); } catch (e) { }
+        } else visit(body, 0);
+        return ids;
     }
+    function transactionContext(url, body) {
+        var ids = requestIds(url, body);
+        return activeAttempt && ids.size === 1 && ids.has(activeAttempt.leadId) ? { attemptId: activeAttempt.attemptId, leadId: activeAttempt.leadId } : null;
+    }
+    function handleAcquisitionResponse(payload, sourceUrl, context, status) {
+        // Unrelated manual requests, ID-less transactions, and stale attempts cannot confirm the current lead.
+        if (!context || !context.attemptId || !context.leadId || !isAcquisitionUrl(sourceUrl)) return;
+        var result = Core.classifyResponse(payload, status);
+        var parsed = payload;
+        if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch (e) { parsed = null; } }
+        var responseIds = new Set();
+        function collectIds(value, depth) {
+            if (!value || typeof value !== 'object' || depth > 4) return;
+            if (Array.isArray(value)) { value.slice(0, 100).forEach(function (item) { collectIds(item, depth + 1); }); return; }
+            Core.leadIds(value, false).forEach(function (value) { responseIds.add(value); });
+            ['DATA', 'data', 'result', 'response', 'Response'].forEach(function (key) { collectIds(value[key], depth + 1); });
+        }
+        collectIds(parsed, 0);
+        if (Array.from(responseIds).some(function (id) { return id !== context.leadId; })) {
+            emitLog('WARN', 'action.result.unknown', 'TRANSACTION_ID_MISMATCH');
+            return;
+        }
+        if (result.ambiguous) { emitLog('DEBUG', 'action.result.unknown', 'NON_AUTHORITATIVE_RESPONSE', { url: safeUrl(sourceUrl) }); return; }
+        // Only a correlated, positive transaction may contribute actual buyer contact fields to CRM.
+        if (result.success || result.action === 'already_acquired') result.buyerContact = Core.buyerContact(parsed);
+        post(Object.assign({ __leadsync_lead_acquired__: true, leadId: context.leadId, attemptId: context.attemptId, sourceUrl: safeUrl(sourceUrl), ts: Date.now() }, result));
+    }
+    function observeNativeContract() {
+        var controller = root.blTxnController;
+        if (!controller || typeof controller.submitLead !== 'function' || !root.document) return false;
+        if (verifiedController === controller.submitLead) return true;
+        // The old build assumed this API/signature existed. Only enable it when a real portal
+        // CTA declares exactly this single-ID contract. No eval, guessed endpoints, or templates.
+        var cards = Core.priorityCards(root.document, 5);
+        for (var i = 0; i < cards.length; i++) {
+            var calls = cards[i].querySelectorAll('[onclick]');
+            for (var c = 0; c < calls.length; c++) {
+                var call = (calls[c].getAttribute('onclick') || '').trim();
+                var match = call.match(/^(?:return\s+)?(?:window\.)?blTxnController\.submitLead\(\s*(['"]?)(\d{6,30})\1\s*\)\s*;?$/);
+                if (match && Core.elementLeadId(cards[i]) === match[2]) {
+                    verifiedController = controller.submitLead;
+                    emitLog('INFO', 'action.native.available', 'PORTAL_CTA_CONTRACT_OBSERVED');
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    function dispatchLead(data) {
+        var inquiryId = Core.id(data.leadId);
+        var attemptId = Core.id(data.attemptId);
+        if (!inquiryId || !attemptId || !Core.activePage(root.location)) return;
+        var previous = dispatched.get(attemptId);
+        if (previous) { post(previous); return; }
+        if (activeAttempt && activeAttempt.attemptId !== attemptId) {
+            post({ __leadsync_dispatch_result__: true, leadId: inquiryId, attemptId: attemptId, invoked: false, reason: 'ANOTHER_ATTEMPT_ACTIVE' });
+            return;
+        }
+        activeAttempt = { leadId: inquiryId, attemptId: attemptId };
+        var msg = { __leadsync_dispatch_result__: true, leadId: inquiryId, attemptId: attemptId, invoked: false, reason: 'NATIVE_UNAVAILABLE' };
+        if (data.native !== false && /^\d{6,30}$/.test(inquiryId) && observeNativeContract()) {
+            // Ack means invoked, NOT acquired. Once invoked, a DOM fallback is forbidden.
+            msg.invoked = true;
+            msg.reason = 'NATIVE_INVOKED';
+            dispatched.set(attemptId, msg);
+            post(msg);
+            try { root.blTxnController.submitLead(inquiryId); }
+            catch (e) { emitLog('WARN', 'action.result.unknown', 'NATIVE_THROW_AFTER_INVOCATION'); }
+        } else {
+            dispatched.set(attemptId, msg);
+            post(msg);
+        }
+        while (dispatched.size > 500) dispatched.delete(dispatched.keys().next().value);
+    }
+    function onMessage(evt) {
+        if (!evt || evt.source !== root || !evt.data || (evt.origin && root.location && evt.origin !== root.location.origin)) return;
+        var data = evt.data;
+        if (data.__leadsync_ready__) {
+            ready = true;
+            while (buffer.length) { var msg = buffer.shift(); msg.droppedCount = dropped; post(msg); }
+            observeNativeContract();
+        }
+        if (data.__leadsync_stream_control__) {
+            paused = data.__leadsync_stream_control__ !== 'resume';
+            optInPulling = data.proactiveFeedPolling === true;
+            if (paused || !optInPulling) stopProactiveStreamPuller(); else startProactiveStreamPuller();
+        }
+        if (data.__leadsync_dispatch_lead__) dispatchLead(data);
+        if (data.__leadsync_attempt_end__ && activeAttempt && activeAttempt.attemptId === data.attemptId) activeAttempt = null;
+    }
+    if (root.addEventListener) root.addEventListener('message', onMessage);
 
-    emitLog('INFO', 'network.interceptor.initialized', 'SUCCESS');
-
-    if (typeof window !== 'undefined') {
-        window.__leadsync_interceptor__ = {
-            extractLeads: extractLeads,
-            cleanAndDedupLeads: cleanAndDedupLeads,
-            isLeadFeedUrl: isLeadFeedUrl,
-            isAcquisitionUrl: isAcquisitionUrl,
-            handleAcquisitionResponse: handleAcquisitionResponse,
-            getLastLeadFeedUrl: getLastLeadFeedUrl,
-            setLastLeadFeedUrl: setLastLeadFeedUrl,
-            pullLeadStream: pullLeadStream,
-            startProactiveStreamPuller: startProactiveStreamPuller,
-            stopProactiveStreamPuller: stopProactiveStreamPuller
+    // Patch prototype methods, preserving XHR constructor identity and instances created by the portal.
+    var XHR = root.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+        var open = XHR.prototype.open;
+        var send = XHR.prototype.send;
+        var setHeader = XHR.prototype.setRequestHeader;
+        var requests = new WeakMap();
+        XHR.prototype.open = function (method, url) {
+            var previous = requests.get(this);
+            if (previous && previous.cancelObservation) previous.cancelObservation();
+            requests.set(this, { method: String(method || 'GET').toUpperCase(), url: String(url || ''), hadSensitiveHeaders: false });
+            return open.apply(this, arguments);
+        };
+        if (setHeader) XHR.prototype.setRequestHeader = function (name) {
+            var meta = requests.get(this);
+            if (meta && /auth|token|csrf|cookie|key|glid|user/i.test(name)) meta.hadSensitiveHeaders = true;
+            return setHeader.apply(this, arguments);
+        };
+        XHR.prototype.send = function (body) {
+            var xhr = this;
+            var meta = requests.get(xhr);
+            if (meta && (isLeadFeedUrl(meta.url) || isAcquisitionUrl(meta.url))) {
+                var context = isAcquisitionUrl(meta.url) ? transactionContext(meta.url, body) : null;
+                var onLoad = function () {
+                    try {
+                        var payload = xhr.responseType === 'json' ? xhr.response : (!xhr.responseType || xhr.responseType === 'text') ? xhr.responseText : null;
+                        if (isAcquisitionUrl(meta.url)) handleAcquisitionResponse(payload, meta.url, context, xhr.status);
+                        else if (xhr.status >= 200 && xhr.status < 300) handleLeadResponse(payload, meta.url, meta);
+                    } catch (e) { /* Observation must not affect the portal. */ }
+                };
+                var cleanup = function () {
+                    xhr.removeEventListener('load', onLoad);
+                    ['abort', 'error', 'timeout', 'loadend'].forEach(function (name) { xhr.removeEventListener(name, cleanup); });
+                };
+                meta.cancelObservation = cleanup;
+                xhr.addEventListener('load', onLoad, { once: true });
+                ['abort', 'error', 'timeout', 'loadend'].forEach(function (name) { xhr.addEventListener(name, cleanup, { once: true }); });
+            }
+            return send.apply(this, arguments);
         };
     }
-    if (typeof module !== 'undefined' && module.exports) {
-        module.exports = {
-            extractLeads: extractLeads,
-            cleanAndDedupLeads: cleanAndDedupLeads,
-            isLeadFeedUrl: isLeadFeedUrl,
-            isAcquisitionUrl: isAcquisitionUrl,
-            handleAcquisitionResponse: handleAcquisitionResponse,
-            getLastLeadFeedUrl: getLastLeadFeedUrl,
-            setLastLeadFeedUrl: setLastLeadFeedUrl,
-            pullLeadStream: pullLeadStream,
-            startProactiveStreamPuller: startProactiveStreamPuller,
-            stopProactiveStreamPuller: stopProactiveStreamPuller
-        };
+    if (origFetch) root.fetch = function (input, init) {
+        var url = typeof input === 'string' ? input : input && (input.url || String(input));
+        var meta = { url: url, method: String(init && init.method || input && input.method || 'GET').toUpperCase(), hadSensitiveHeaders: false };
+        var headers = init && init.headers || input && input.headers;
+        try { new Headers(headers || {}).forEach(function (value, key) { if (/auth|token|csrf|cookie|key|glid|user/i.test(key)) meta.hadSensitiveHeaders = true; }); } catch (e) { }
+        var context = isAcquisitionUrl(url) ? transactionContext(url, init && init.body) : null;
+        // Request bodies are cloned ONLY for correlation, never retained or replayed.
+        var contextPromise = Promise.resolve(context);
+        if (!context && isAcquisitionUrl(url) && input && typeof input.clone === 'function' && !(init && init.body)) {
+            var attemptSnapshot = activeAttempt && Object.assign({}, activeAttempt);
+            try { contextPromise = input.clone().text().then(function (body) {
+                var ids = requestIds(url, body);
+                return attemptSnapshot && ids.size === 1 && ids.has(attemptSnapshot.leadId) ? attemptSnapshot : null;
+            }).catch(function () { return null; }); } catch (e) { }
+        }
+        var promise = origFetch.apply(this, arguments);
+        if (isLeadFeedUrl(url) || isAcquisitionUrl(url)) {
+            // Attach a side observer; return the original response promise and untouched body.
+            promise.then(function (response) {
+                try {
+                    var clone = response.clone();
+                    clone.text().then(function (text) {
+                        if (isAcquisitionUrl(url)) contextPromise.then(function (ctx) { handleAcquisitionResponse(text, url, ctx, response.status); });
+                        else if (response.status >= 200 && response.status < 300) handleLeadResponse(text, url, meta);
+                    }).catch(function () { });
+                } catch (e) { }
+            }, function () { });
+        }
+        return promise;
+    };
+    var OriginalWS = root.WebSocket;
+    if (OriginalWS) {
+        function ObservedWebSocket(url, protocols) {
+            var socket = protocols === undefined ? new OriginalWS(url) : new OriginalWS(url, protocols);
+            if (parsedUrl(String(url))) socket.addEventListener('message', function (event) {
+                if (typeof event.data === 'string' && event.data.length < 4 * 1024 * 1024) handleLeadResponse(event.data, String(url));
+            });
+            return socket;
+        }
+        ObservedWebSocket.prototype = OriginalWS.prototype;
+        Object.setPrototypeOf(ObservedWebSocket, OriginalWS);
+        root.WebSocket = ObservedWebSocket;
     }
-
+    function getLastLeadFeedUrl() { return lastLeadFeedUrl; }
+    function pullLeadStream() {
+        if (!ready || paused || !optInPulling || pullInProgress || !Core.activePage(root.location) || !lastLeadFeedUrl || !origFetch || Date.now() - lastNativeFeedAt < 15000) return Promise.resolve(null);
+        pullInProgress = true;
+        pullController = new AbortController();
+        var timeout = setTimeout(function () { if (pullController) pullController.abort(); }, 10000);
+        return origFetch.call(root, lastLeadFeedUrl, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json' }, signal: pullController.signal }).then(function (response) {
+            if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 404 || response.status === 410) { lastLeadFeedUrl = null; stopProactiveStreamPuller(); }
+            if (!response.ok) { pullDelay = Math.min(120000, pullDelay * 2); return null; }
+            pullDelay = 15000;
+            return response.text().then(function (text) { handleLeadResponse(text, lastLeadFeedUrl, { method: 'GET', proactive: true }); return text; });
+        }).catch(function () { pullDelay = Math.min(120000, pullDelay * 2); return null; }).finally(function () { clearTimeout(timeout); pullInProgress = false; pullController = null; });
+    }
+    function startProactiveStreamPuller() {
+        if (pullTimer || paused || !optInPulling) return;
+        pullTimer = setTimeout(function () {
+            pullTimer = null;
+            pullLeadStream().finally(function () { if (!paused && optInPulling) startProactiveStreamPuller(); });
+        }, pullDelay);
+    }
+    function stopProactiveStreamPuller() { if (pullTimer) clearTimeout(pullTimer); pullTimer = null; if (pullController) pullController.abort(); }
+    if (root.addEventListener) root.addEventListener('pagehide', function () { paused = true; stopProactiveStreamPuller(); });
+    var api = { extractLeads: extractLeads, cleanAndDedupLeads: cleanAndDedupLeads, isLeadFeedUrl: isLeadFeedUrl, isAcquisitionUrl: isAcquisitionUrl, handleLeadResponse: handleLeadResponse, handleAcquisitionResponse: handleAcquisitionResponse, requestIds: requestIds, observeNativeContract: observeNativeContract, getLastLeadFeedUrl: getLastLeadFeedUrl, pullLeadStream: pullLeadStream, startProactiveStreamPuller: startProactiveStreamPuller, stopProactiveStreamPuller: stopProactiveStreamPuller };
+    root.__leadsync_interceptor__ = api;
+    if (typeof module !== 'undefined' && module.exports) module.exports = api;
+    emitLog('INFO', 'network.interceptor.initialized', 'PASSIVE_OBSERVATION_READY');
 })();

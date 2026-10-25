@@ -1,160 +1,97 @@
-# LeadSync Extension — Current Architecture
+# LeadSync — current extension architecture
 
-This document describes the implementation currently present in this workspace. Runtime code is authoritative when it differs from older README text, comments, defaults, or UI placeholders. Timing values are requested timer delays; browsers may schedule them later, especially in background tabs.
+Updated 2026-10-25 for the reliability implementation. This replaces obsolete descriptions of product-only target binding, unconditional native dispatch, 30 ms scanning and automatic page reloads. Source code is authoritative. Timer values are requested delays, not scheduling guarantees.
 
-## 1. Project layout
+## Execution boundaries
 
-| Path | Responsibility |
+| Execution context | Modules / responsibility |
 |---|---|
-| `manifest.json` | Manifest V3 wiring, IndiaMART/Supabase permissions, content-script worlds and startup timing. |
-| `service-worker.js` | Background message handlers, Supabase proxy/administrative operations, status/log storage and a one-minute Chrome alarm. |
-| `src/network-interceptor.js` | MAIN-world observation of IndiaMART XHR/fetch responses, normalization, deduplication, buffered message bridge, acquisition confirmations and optional lead-stream polling. |
-| `src/supabase-service.js` | Supabase REST client, filter/cache loading, lead/history writes, filter status/stats and timeouts. |
-| `src/bundle.js` | Isolated-world application: configuration, scanning, parsing, matching, safety, queue, review UI, acquisition, status panel and orchestration. |
-| `config/` | Extension configuration page. |
-| `popup/` | Toolbar popup and control UI. |
-| `debug/` | Local diagnostics UI. |
-| `migration/` | Migration-related UI/resources. |
-| `tests/` | Node-based regression, integration, matching, reliability, lifecycle and latency-audit scripts. |
-| `README.md` | User/developer guide; some sections may describe older behavior, so compare with runtime code. |
-| `rules.json` | Static Declarative Net Request rules referenced by the manifest. |
-| `plugin.png` | Toolbar and extension icon asset. |
-| `skills-lock.json`, `.agents/`, `.gravitas/` | Repository-local development/agent tooling, not part of the lead runtime. |
-| `_metadata/` | Local extension/build metadata. |
-| `scratch_user_bundle_full.txt` | Local scratch artifact; not loaded by the manifest. |
+| IndiaMART MAIN world, `document_start` | `src/lead-core.js` then `src/network-interceptor.js`; observe XHR/fetch/WebSocket responses and invoke only an observed supported portal action contract |
+| Chrome isolated content world, `document_start` | `src/lead-core.js`, `src/supabase-service.js`, `src/bundle.js`; initialize stored settings/safety before processing; evaluate and control the existing page UI |
+| MV3 service worker | Imports core, Supabase service and `src/background-state.js`; durable claims/outbox, REST proxy, alarms, status/log messages |
+| Extension pages | Popup, configuration/filter editor, diagnostics; not required to remain open |
+| External deployment | Existing Vercel CRM ↔ Supabase ↔ authenticated seller session; not deployed or live-verified by these changes |
 
-There is no root `package.json` in the current workspace; tests are run directly with Node.
+Minimum supported Chrome version: 111, for manifest-declared MAIN-world scripts. Both content worlds load the same core contracts. Node imports of `src/bundle.js` export its actual matcher/metrics/lifecycle helpers without booting browser UI; compatibility test helpers no longer carry copied implementations.
 
-## 2. Browser execution and message flow
+The same-window page-message bridge is **not an authentication boundary**. It carries bounded/validated observations and attempt/identity correlation, not tokens, cookies, service-role credentials or authentication-header captures. Untrusted page content cannot be treated as a secret channel. The worker accepts extension messages and restricts proxy origins, REST paths and methods; it does not act as an arbitrary cross-origin proxy.
 
-The extension targets the IndiaMART seller lead pages listed in `manifest.json`.
-The manifest declares `storage`, `unlimitedStorage`, `tabs`, `alarms`, `notifications` and `declarativeNetRequest`, with host access scoped to the IndiaMART seller/app pages and the configured Supabase origin.
+## Discovery and initialization
 
-1. At `document_start`, `src/network-interceptor.js` runs in the page's **MAIN world**, where it can observe the page's XHR/fetch traffic and IndiaMART-owned page controller.
-2. At `document_end`, `src/supabase-service.js` and then `src/bundle.js` run as content scripts in the isolated extension world.
-3. The interceptor posts sanitized lead observations to the isolated world with `window.postMessage`. The bundle announces readiness with `__leadsync_ready__`; until then, the interceptor buffers messages.
-4. The bundle evaluates observed network leads and independently scans the rendered DOM. A lead can be seen by both routes; inquiry IDs, queue deduplication, lifecycle state and acquisition records prevent duplicate handling.
-5. The service worker handles extension runtime messages and Supabase proxy operations. Page-to-page `postMessage` is a same-window bridge, not an authentication boundary; messages are validated for expected shapes/IDs but must not be treated as secrets.
+1. MAIN-world wrappers are installed early. Response handling extracts lead observations independently of DOM rendering; malformed identities are not promoted to targets.
+2. Before the isolated listener is ready, MAIN buffers up to 100 messages and announces/replays the backlog on the readiness handshake. Recent payload signatures are bounded (2,000 / 30 seconds); fresh metadata is not suppressed just because the inquiry was seen.
+3. The orchestrator restores configuration, pause, circuit/safety counters, acquired IDs and filter scope before enabling actions. Pending network observations are bounded to 1,000; freshness is checked before replay.
+4. Network batches are not limited to five. DOM discovery uses the **first five visible cards**, including ancestor visibility/opacity checks. The scanner observes mutations and uses a one-second fallback cadence rather than a tight 30 ms loop.
+5. A repeated exact inquiry can be enriched and reevaluated when its qualification data or filter revision changes. Fresh structured network product/message/category/country/quantity fields are not overwritten by a stale hydrating card. Visible same-ID DOM contacts/missing fields may enrich it.
+6. An identity-less card may later become actionable when an exact inquiry key arrives. A new target may recover a proven `NOT_ATTEMPTED` / target-unavailable observation even if qualification fields are unchanged. `UNKNOWN` cannot become a new purchase because of hydration or a filter refresh.
 
-## 3. Startup, filters and Supabase
+## Identity and matching
 
-- The orchestrator loads local settings/keywords, constructs the scanner, matcher, queue, safety controller and UI, then marks itself initialized.
-- Filter data can be restored from `sessionStorage` (`bl_cached_filters`) when its timestamp is less than **60 seconds** old. The Supabase service also has a **30-second in-memory filter TTL** and a **60-second storage-cache TTL** (`cached_filters_v1`).
-- A cache miss starts a Supabase fetch. Read and write requests use **15-second** abort timeouts; health checks use **5 seconds**. Filter fetch has two internal network attempts, with a **50 ms** delay before the second attempt.
-- Orchestrator-level Supabase sync retries after **2, 5, 15, 30 and 60 seconds**, up to five retries after the initial attempt. Successful filters are copied into the matcher and session cache.
-- Network leads arriving before filters are loaded are held in `_pendingNetworkLeadCards` and replayed when filter state updates. This map is bounded to **1,000** cards; oldest entries are evicted if the cap is exceeded.
-- The DOM route also defers cards while Supabase filters are unavailable. It removes the scanner's emitted marker so a later scan can reconsider the card.
-- When Supabase is enabled but no active filters are available, scanning becomes idle rather than matching against an empty filter set.
-- The service worker creates a Chrome alarm that checks filters every **1 minute** while an IndiaMART seller tab is open. The in-page content script separately checks for dynamic filter changes every **30 seconds** while not paused.
+`LeadSyncCore` validates canonical inquiry IDs without unsafe number rounding, substring extraction, generic buyer IDs, positional card indices or external-link identity. Conflicting semantic aliases/multiple action targets are rejected. DOM linking/acquisition uses equality of the genuine inquiry key, not product/city similarity.
 
-## 4. Lead discovery and fallback paths
+All acquisition keywords and filter values are dynamic. The matcher retains modern-column and legacy JSON compatibility, explicit empty-field clears, country/contact/quantity hard gates, required/negative rules, product/dosage/unit qualification and ranking. Selected countries use OR; selected contact channels use OR; those gates are independently ANDed with the rest of a rule. Unknown country is never silently assumed to be India. Global optional strict-country filtering is separate from per-filter countries.
 
-### DOM scanner
+An inverted token index limits full evaluations to plausible rules; common dosage/unit tokens cannot fan out to every rule. The local scoring path also uses normalized channel availability (including booleans), configurable weights/penalties/preferences and a bounded numeric minimum score. CRM matching and local scoring retain their existing distinct paths.
 
-- The scanner uses a `MutationObserver` on the lead-feed container when it can identify one; otherwise it watches the document body/root and tries to narrow the target later.
-- Current settings in `Scanner` are **3 ms mutation debounce** and **30 ms reconciliation fallback**.
-  - The debounce coalesces mutations while a scan timer is pending. It is not a guaranteed 3 ms end-to-end lead pickup time.
-  - The fallback requests a scan about **33 times/second** while the scanner is running, even if no mutation was observed. This can cause repeated DOM queries and may increase CPU use.
-  - If a scan is already running, another scan request returns without starting a concurrent scan.
-- Each DOM scan queries supported lead-card selectors and emits at most **5 new cards**. It continues past known cards so older visible cards do not permanently starve later ones.
-- Empty/unhydrated cards schedule a retry after **150 ms**. The navigator also makes up to **3 content checks**, **25 ms** apart, when cards/text have not rendered yet.
-- Rate-limit warning text is checked at most once per **5 seconds**. Past/consumed pages, paused state, no active filters and rate-limit warnings prevent DOM scanning.
-- The navigator scans cards already visible on the page; automatic scrolling and load-more clicking are disabled in its current live path. Existing cards cause navigator startup after **20 ms**; an empty feed uses **150 ms**. Its normal live follow-up loop waits **2 seconds** after a completed pass/idle queue; the independent scanner observer/fallback continues between those passes.
+## Filter cache, invalidation and quota ownership
 
-### Passive network path
+- Memory TTL: 10 seconds. Same-client storage snapshot: at most 60 seconds, retaining the original successful read timestamp, with background revalidation. Older/future-dated/wrong-scope snapshots cannot authorize actions.
+- Successful empty filter sets are meaningful: clear rules and idle acquisition, but keep refresh/recovery alive. Missing/stale filters fail closed.
+- Concurrent reads coalesce within the current scope. Scope generation and request-start ordering prevent old responses from overwriting new state, including shared storage adoption.
+- Semantic signatures cover nested country/contact/quantity/required/negative/match settings, not telemetry/revision-only noise. Refresh after stale-cache recovery can replay recent observations even if rule semantics did not change.
+- Content filter checks request refresh every 10 seconds; worker Chrome alarms provide a one-minute fallback without a popup. These are not Realtime subscriptions or instantaneous CRM propagation.
+- Single-ID reads reconcile the affected active/inactive/deleted row and advance ordering, **without extending freshness of unrelated list entries**.
+- Quota success counts only verified acquisition/unique-buyer results. Existing 15-second quota reactivation remains, but requires the acknowledged extension-owned disabled revision. It cannot blindly undo a newer manual CRM disable/edit/delete. A late old-round acknowledgment cannot change newer metadata, clear its promise or release its reservation.
+- Telemetry does not explicitly mutate `updated_at`, active/running fields or filter rules. Server triggers may still advance a revision; revision mismatch fails closed.
+- The editor preserves unrelated JSON constraints, uses revision CAS (including null revisions), and requires actual write rows. Legacy bulk migration only fills fields still null at the expected revision; modern empty arrays are intentional clears.
 
-- The MAIN-world interceptor observes matching lead-feed XHR/fetch responses, extracts lead arrays from known response shapes, normalizes fields and deduplicates inquiry IDs for **10 minutes** (cache cap: **1,000** IDs).
-- Contact details are represented as availability flags in the bridge payload; raw phone/email values are not copied into those normalized passive lead records.
-- Before the isolated script signals readiness, up to **50** response messages are buffered; the oldest message is dropped if the buffer fills.
-- Once an authentic lead-feed URL has been observed, a proactive same-origin GET puller may poll that URL every randomized **2–4 seconds**. It does not guess a hardcoded feed endpoint, runs only on the supported active lead page, and does not poll while paused. This is a separate fallback from the 30 ms DOM reconciliation scan.
-- Network observations are routed directly to lead evaluation, bypassing the DOM debounce. Leads are still subject to active-filter, deduplication, safety and mode checks.
+Client scope is a runtime filter selector/cache boundary, **not database RLS**. Blank preserves existing all-RLS-permitted behavior. No client column/schema was invented for lead/history writes.
 
-## 5. Parsing, matching and eligibility
+## Mode, queue and authorization
 
-Both routes normalize into a lead model containing available product/requirement text, location, inquiry identity, contact-availability indicators and source metadata.
+- **Monitor:** observe/evaluate/store matched observations; no portal acquisition.
+- **Dry Run:** evaluate/simulate/store observations; no real acquisition or fabricated success.
+- **Assisted / REVIEW alias:** approve an exact inquiry before queueing.
+- **Automatic:** queue eligible leads without per-lead approval.
 
-The matching implementation is in `KeywordManager`/`LeadMatcher` in `src/bundle.js`; active Supabase filter rules are preferred when Supabase is enabled. Filter evaluation may apply product criteria, required and negative terms, location/country constraints, contact requirements and filter-specific eligibility/quotas. Product and word-boundary matching helpers are used to avoid overly broad substring matches. Location-only filters are represented as wildcard rules, so a missing product title does not automatically disqualify a lead when other useful details satisfy a filter.
+One active acquisition verification per tab. The worker serializes acquisition leases by inquiry across tabs, not all purchases across distinct inquiries. Safety counters/cooldowns and queue reservations prevent local overcommit; they are not a globally transactional multi-tab or multi-profile budget.
 
-The result includes pass/fail, score/confidence and matched-filter information. In the current live DOM path, there is no separate post-match scorer threshold gate: the active filter evaluation is the principal matching decision. Strict global country behavior applies to the local-keyword path; Supabase filters enforce their own country rules.
+After acquiring a persisted worker claim and again before the CTA/confirmation, check mode, pause, circuit, approval, current full filter, country, freshness, rate limits and quota. Read-only mode/filter changes cannot authorize stale submissions. Revocation after initiation becomes uncertain rather than pretending the already-sent request never happened.
 
-Before acquisition, the selected filter is revalidated for eligibility and the safety controller checks limits. A filter defaults to a target of **10 distinct buyers** unless configured otherwise; after reaching its target it is deactivated and a **15-second** reactivation timer is scheduled. The source contains a stale comment describing this as 60 seconds; runtime delay is 15 seconds.
+The native fast path requires an observed legitimate portal CTA proving a supported single-ID controller call. Merely discovering a controller function is insufficient. Otherwise the adapter waits for an exact-ID visible CTA and activates it once. A missing native acknowledgment is `UNKNOWN`; it does not trigger a competing click/request. No speculative acquisition endpoint, arbitrary POST replay or positional/product fallback exists.
 
-## 6. Queue, modes and acquisition/contact
+## Outcome verification
 
-- `LeadQueue` deduplicates by both lead ID and inquiry ID. It is intentionally **sequential (`MAX_PARALLEL = 1`)** because the action path shares page dialogs and one in-flight confirmation handler.
-- Modes:
-  - **MONITOR:** observe and report; no acquisition.
-  - **DRY_RUN:** exercise eligibility flow without real acquisition.
-  - **ASSISTED/REVIEW:** show a review card and wait for the user's confirmation.
-  - **AUTOMATIC:** attempt eligible acquisition without a review click.
-- For a network lead, the adapter first tries the IndiaMART page controller / native dispatch route when available. It also attempts to associate the observation with its rendered card.
-- If the card has not rendered, it searches immediately, then polls every **10 ms** for up to **400 ms**. If unavailable, it returns a failure rather than claiming success.
-- The DOM fallback finds an eligible “Contact Buyer”/related CTA and clicks through the page's normal interaction path. It watches for positive evidence of acquisition/contact and handles confirmation or purchase dialogs.
-- Acquisition confirmation polls at **10 ms** intervals. The effective confirmation timeout is clamped to **600–1,500 ms** (default configured value 800 ms). PopupManager has a separate **60 ms** detection interval and a configured timeout (default **15 seconds**).
-- Explicit failure paths include no CTA, missing card, sold-out/lost-race, insufficient balance, subscription requirement, unconfirmed popup and unverified timeout. Detached/disabled buttons alone are not treated as proof of success.
-- Successful/failed outcomes update state, metrics, duplicate records, UI and (when enabled) Supabase lead/history records. Database writes are generally asynchronous/non-blocking relative to continued scanning.
+Verification observes:
 
-## 7. Safety, pausing and refresh
+- Correlated acquisition request/response, scoped to attempt and exact inquiry; recursive response IDs cannot contradict the request identity.
+- A new visible exact-card portal status transition, or new actual contact evidence absent from its baseline. Buyer requirement text, generic disabled buttons and pre-existing telephone links are not confirmation.
+- Newly owned/scoped dialogs; pre-existing/stale or differently identified dialogs are not clicked. Send/Confirm alone remains intermediate. Observer checks are event-driven with a 250 ms heartbeat; default configurable confirmation timeout is 15 seconds (bounded 1–60 seconds).
 
-- Default safety limits in the bundle are **60/minute, 400/hour, 2,000/day and 1,000/session**, with a default **0 ms** cooldown. Counters persist in extension storage/session storage.
-- The scanner checks for IndiaMART restriction/rate-limit warning phrases. Detection trips the restriction path, pauses scanner/navigator/queue and requires user action to resume.
-- The UI's refresh countdown is **10 seconds** (`_refreshCountdownSeconds`). On expiry, a safety gate checks every **500 ms** that the queue, scanner, lead lifecycle, state machine and dialogs are idle and the extension is not paused. If busy, refresh is deferred; after up to **20 checks** (10 seconds), the countdown restarts.
-- A safe countdown expiry calls `window.location.reload()`. Thus it can produce a hard reload when the countdown is active and the page is quiescent; it is not allowed to interrupt active lead work. Startup of the in-page panel starts this countdown; resume restarts it.
-- There is a stale **15s** placeholder in the panel's initial HTML, but startup immediately updates the label from the 10-second countdown setting.
-- The navigator has separate legacy auto-reload settings. In the live browser path its autonomous loop is disabled; the safety-gated refresh controller above is the active hard-refresh path.
+Business errors (sold/unavailable, balance/subscription, session/eligibility/rate limit, rejected) take precedence over positive-looking transport/UI signals. A generic HTTP/CODE 200, null mobile field or missing response is not authoritative success.
 
-## 8. Other timers and background work
+Local states include `MATCHED`, `MONITORED`, `DRY_RUN`, `READY_FOR_REVIEW`, `ACQUISITION_PENDING`, `ACQUIRED`, `CONTACTED`, `ALREADY_ACQUIRED`, `UNAVAILABLE`, `ACQUISITION_FAILED`, `NOT_ATTEMPTED`, `BLOCKED` and `UNKNOWN`. A click/request is initiation, not acquisition. Acquisition and actual contact/send verification remain separate. Late correlated success can promote the same completed attempt once without fabricating a second attempt/sample.
 
-| Work | Current interval/delay |
-|---|---:|
-| DOM mutation debounce | 3 ms |
-| DOM reconciliation fallback | 30 ms |
-| DOM empty-card retry | 150 ms |
-| Navigator initial delay | 20 ms with existing cards; 150 ms otherwise |
-| Navigator normal live next pass | 2,000 ms after pass/queue completion |
-| Navigator retry loop setting | 100 ms configured; mainly retry/error path in live behavior |
-| Navigator content hydration retries | 3 retries, 25 ms apart |
-| Network proactive stream puller | randomized 2,000–4,000 ms |
-| Network lead identity cache | 10-minute TTL; max 1,000 IDs |
-| Network pre-ready message buffer | maximum 50 messages |
-| Pending leads during filter load | maximum 1,000 cards |
-| Native controller DOM-card wait | 10 ms polling, max 400 ms |
-| Acquisition confirmation polling | 10 ms; effective timeout 600–1,500 ms |
-| Popup detection | 60 ms polling; configured timeout 15,000 ms |
-| Hard-refresh countdown | 10 seconds; safety gate checks every 500 ms |
-| Supabase filter in-memory cache | 30 seconds |
-| Supabase storage filter cache | 60 seconds |
-| Supabase read/write timeout | 15,000 ms |
-| Supabase health timeout | 5,000 ms |
-| Supabase filter network retry | 2 attempts; 50 ms before retry |
-| Orchestrator Supabase sync retry | 2s, 5s, 15s, 30s, 60s (max five retries) |
-| Dynamic filter check | 30 seconds |
-| Supabase stats push | 30 seconds |
-| Inactivity heartbeat | 30 seconds |
-| Duplicate cleanup | 120 seconds |
-| Service-worker filter alarm | 1 minute |
+No automatic reload/countdown loop, synthetic idle/session-refresh clicks, generic backdrop removal or blanket portal modal dismissal is used. Stop persists; returning from BFCache refreshes filters without reviving a user stop. Manual reload waits for active work/outbox acknowledgment guards.
 
-## 9. Observability and testing
+## Durable leases and CRM outbox
 
-- Structured logs include operation/trace IDs, stage, result/reason, and durations for DOM scan cycles, network payload parsing, filter evaluation, Supabase sync and acquisition outcomes.
-- The UI reports acquisition speed and acceptance rate from runtime samples; these are not a live benchmark report and should not be interpreted as measured end-to-end latency without checking their sample counts and timing definitions.
-- Regression scripts cover scanner fairness, matching, network acquisition/review flows, filter-loading races, concurrency, refresh safety and large-filter scenarios. Example focused commands:
+`src/background-state.js` owns worker state under `acquisition_lease_v1:` and `crm_outbox_v1:` keys in `chrome.storage.local`.
 
-```powershell
-node --check src\bundle.js
-node tests\reliability_audit.test.js
-node tests\concurrency_overlap_inspection.test.js
-node tests\safe_countdown_refresh.test.js
-```
+1. Hydrate before accepting claims. Serialize state transitions and persist the claim before authorizing a portal side effect. Storage failure means no action.
+2. A lease binds inquiry, attempt and tab owner. An unrelated tab/attempt cannot complete it. Proven no-action releases it. Verified acquisition/already-acquired remains confirmed for 30 days; definite failure/unavailability retains a 10-minute lease. Pending/unknown uncertainty **does not automatically expire into replay**, including after a worker restart.
+3. The lease map has a 5,000-record cap. Expired definite results can be cleaned; uncertain claims cannot be evicted to make capacity. Confirmed local dedup IDs can retain longer than the worker lease.
+4. A per-inquiry outbox job merges nonempty enrichment and monotonic matched/contacted state. Persist/version it before responding queued. Cap: 1,000 jobs; retain existing jobs and block new purchase authorization when full.
+5. Drain off the acquisition critical path. Reconcile inquiry existence, insert/conflict ambiguity, conditional updates and history acknowledgments. A late failure/match cannot downgrade contacted success. Empty/RLS-blocked enrichment is not an acknowledgment.
+6. If newer data arrives during a write, keep its version and revisit it in the same drain (up to 20 rounds). Transient failures retain durable jobs with exponential deadlines (5 seconds up to 15 minutes); startup and one-minute alarms revisit them. Actual retry time can be later than a deadline because the worker sleeps.
+7. Notify synced only after acknowledged row/history writes. Queued/persisted locally is not synced.
 
-- Unit/integration tests do not replace live IndiaMART validation. Browser timer throttling, portal DOM/API changes, account balance, seller eligibility and server-side lead races can change real outcomes and latency.
+Existing `leads` fields and `lead_history` `CONTACTED`/`FAILED` vocabulary are unchanged. For compatibility, verified acquisition uses the CRM's existing contacted row convention even if a separate message/contact step is unverified; detailed state, `contactSuccess`, ambiguity/evidence live in `action_details`. Consumers must not interpret every `FAILED` history action as definite portal rejection.
 
-## 10. Important implementation caveats
+No DDL, RLS, enum or CRM deployment was changed/verified. Real database uniqueness/authorization/triggers must support the existing contracts. Multi-profile acquisition coordination and truly atomic cross-client DB writes are not established by local worker serialization.
 
-1. **Aggressive scan timings:** the 30 ms fallback can request about 33 DOM scans/second while active. Since each scan queries page DOM, monitor CPU and page responsiveness on a real feed; do not assume 3 ms debounce means each scan takes 3 ms.
-2. **Bounded buffers:** early network leads are protected while filters load, but the pending queue caps at 1,000. The interceptor's pre-ready buffer separately caps at 50.
-3. **Discovery is not acquisition:** visible leads can still be rejected by active filters, quotas, safety limits, mode, deduplication, missing identity/parseable fields, or portal/account state.
-4. **Network pull is not the primary immediate signal:** passive observation reacts to genuine page requests; the 2–4 second puller is a backup and only starts after the interceptor has learned a valid feed URL.
-5. **Sequential acquisition is intentional:** raising concurrency without redesigning shared popup/in-flight confirmation state risks cross-lead actions and false confirmations.
-6. **Source/docs drift exists:** README timing/scroll descriptions, legacy comments and UI placeholders do not always match current live behavior. Re-check source before changing a documented timer.
-7. **Privacy and credentials:** do not put service-role credentials or buyer PII in this document, logs, or page-message bridge. Keep database authorization enforced server-side.
+## Diagnostics and validation boundary
+
+Runtime suites execute actual modules in jsdom/VM with mocked transports, including the actual imported worker script, restart/shared-storage/alarm cases. Legacy entry points intentionally delegate to those suites; matcher/lifecycle/metrics compatibility helpers export production implementations. Tests do not prove real Chrome scheduling, origin isolation, portal markup/controller semantics, seller eligibility or deployed Supabase behavior.
+
+The last local aggregate is 113 passing tests; full commands/results and a 700-filter/100-lead **local** timing diagnostic are in [the implementation report](ANTIGRAVITY_CHANGE_REPORT.md). Safe live acceptance steps and recovery limits are in [LIVE_VALIDATION.md](docs/LIVE_VALIDATION.md). Do not use historical `vh-logs.json` or a mocked latency sample as evidence of a real acquisition.
